@@ -1,0 +1,18 @@
+# 로그 파일
+*.log
+logs/
+wandb/
+
+# 모델 weight
+*.pt
+*.pth
+*.ckpt
+
+# 결과물
+results/
+eval/
+
+# 캐시/임시 파일
+__pycache__/
+*.pyc
+*.tmp

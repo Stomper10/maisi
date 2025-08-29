@@ -1,0 +1,57 @@
+model:
+  embedding_dim: 64 ###
+  n_codes: 16384
+  in_channels: 64
+  downsample: [2,2,2]
+  latent_channels: 128 ### 192
+  restart_thres: 1.0
+  no_random_restart: false
+  norm_type: "group"
+  padding_type: "replicate"
+  num_groups: 32
+  image_channels: 1
+  video_disc_channels: 32
+  image_disc_channels: 64
+  video_disc_layers: 3
+  image_disc_layers: 3
+  wavelet_levels: 2 ###
+  wavelet: haar
+  disc_loss_type: "hinge"
+  image_gan_weight: 0.5 # 1.0
+  video_gan_weight: 1.0
+  l1_weight: 0.01
+  commit_weight: 1.0
+  ssim_weight: 4.0
+  lpips_weight: 4.0
+  ms_ssim_weight: 0.3 # no
+  image_gan_feat_weight: 2.0 # 4.0
+  video_gan_feat_weight: 4.0
+  perceptual_weight: 1.0 # 4.0
+  lite: false ###
+
+training:
+  lr: 0.0001
+  train_batch_size: 2
+  valid_batch_size: 1
+  lpips_iter_start: -1 ### 10000
+  perceptual_iter_start: 10000 ### 10000
+  video_discriminator_iter_start: 5000 ### 5000
+  image_discriminator_iter_start: 10000 ### 10000
+  max_train_steps: 200000 ### 100000
+  validation_steps: 5000 ### 5000
+  checkpointing_steps: 5000 ### 5000
+  resume: true
+  seed: 42
+  device: cuda
+  weight_dtype: "fp32"
+
+data:
+  target_size: [224, 192, 192]
+  image_dir: /leelabsg/data/20252_unzip
+  train_label_dir: /shared/s1/lab06/wonyoung/diffusers/sd3/data/train.csv ###
+  valid_label_dir: /shared/s1/lab06/wonyoung/diffusers/sd3/data/valid.csv ###
+
+logging:
+  output_dir: /shared/s1/lab06/wonyoung/diffusers/wldm/results/
+  report_to: true ###
+  num_samples: 1
