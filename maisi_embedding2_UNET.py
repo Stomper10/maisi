@@ -253,11 +253,11 @@ def create_json_files(gz_files, df):
                 "bottom_region_index": [0, 0, 0, 0], ###
                 "cond": [
                     df.loc[df['eid'] == int(gz_file.split("/")[-1][:7]), "norm_age"].values[0],
-                    # df.loc[df['eid'] == int(gz_file.split("/")[-1][:7]), "sex"].values[0],
-                    # df.loc[df['eid'] == int(gz_file.split("/")[-1][:7]), "norm_csf"].values[0],
-                    # df.loc[df['eid'] == int(gz_file.split("/")[-1][:7]), "norm_cgm"].values[0],
-                    # df.loc[df['eid'] == int(gz_file.split("/")[-1][:7]), "norm_dgm"].values[0],
-                    # df.loc[df['eid'] == int(gz_file.split("/")[-1][:7]), "norm_wm"].values[0],
+                    df.loc[df['eid'] == int(gz_file.split("/")[-1][:7]), "sex"].values[0],
+                    df.loc[df['eid'] == int(gz_file.split("/")[-1][:7]), "norm_csf"].values[0],
+                    df.loc[df['eid'] == int(gz_file.split("/")[-1][:7]), "norm_cgm"].values[0],
+                    df.loc[df['eid'] == int(gz_file.split("/")[-1][:7]), "norm_dgm"].values[0],
+                    df.loc[df['eid'] == int(gz_file.split("/")[-1][:7]), "norm_wm"].values[0],
                 ],
             }
         ]
@@ -278,13 +278,13 @@ def main():
     parser.add_argument(
         "--env_config",
         type=str,
-        default="./configs/environment_maisi_diff_model_train.json",
+        default="./configs/environment_maisi_diff_model.json",
         help="Path to environment configuration file",
     )
     parser.add_argument(
         "--train_config",
         type=str,
-        default="./configs/config_maisi_diff_model_train.json",
+        default="./configs/config_maisi_diff_model.json",
         help="Path to model training/inference configuration",
     )
     parser.add_argument(
@@ -304,19 +304,11 @@ def main():
         help="A validation label dir.",
     )
     args = parser.parse_args()
-    # args.run_name = get_run_name(args.run_name)
-    # device = torch.device(args.device)
 
-    # weight_dtype = torch.float32
-    # if args.weight_dtype == "fp16":
-    #     weight_dtype = torch.float16
-
-    # torch.manual_seed(args.seed)
     torch.backends.cuda.matmul.allow_tf32 = True
     torch.backends.cudnn.allow_tf32 = True
     torch.backends.cudnn.benchmark = True
     torch.backends.cudnn.deterministic = False
-    # set_determinism(seed=args.seed)
 
     print("[Config] Loaded hyperparameters:")
     print(yaml.dump(args, sort_keys=False))

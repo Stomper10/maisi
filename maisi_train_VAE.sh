@@ -1,6 +1,6 @@
 #!/bin/bash
 
-#SBATCH --job-name=EX_maisi_vae_s1_ukb
+#SBATCH --job-name=EX_maisi_vae_s2_ukb
 #SBATCH --nodes=1
 #SBATCH --gres=gpu:4
 #SBATCH --ntasks-per-node=1      # OPTIMIZATION: torchrun이 프로세스를 관리하므로 ntasks는 1로 설정
@@ -11,11 +11,18 @@
 #SBATCH --mem=200GB
 #SBATCH --signal=B:SIGUSR1@180   # 시간 만료 3분 전 신호 전송
 #SBATCH --open-mode=append
-#SBATCH -o /shared/s1/lab06/wonyoung/maisi/logs/%x-%j.txt
+#SBATCH -o /shared/s1/lab06/wonyoung/maisi/logs_ex/%x-%j.txt
 
 source /home/s1/wonyoungjang/.bashrc
 source /home/s1/wonyoungjang/anaconda3/bin/activate
 conda activate wdm
+
+export MASTER_ADDR=$(scontrol show hostnames "$SLURM_JOB_NODELIST" | head -n1)  # 단일 노드면 127.0.0.1도 OK
+export MASTER_PORT=$((10000 + RANDOM % 50000))
+export NCCL_ASYNC_ERROR_HANDLING=1
+export NCCL_DEBUG=WARN
+export OMP_NUM_THREADS=1
+ulimit -n 1048576
 
 echo "Starting MAISI VAE UKB DDP training on 4 GPUs..."
 
@@ -25,7 +32,7 @@ restarts=$(scontrol show job ${SLURM_JOB_ID} -o | awk -F'|' '{print $11}')
 function resubmit()
 {
     echo "Job time limit approaching. Signaling Python to save and exit..."
-    if [[ -n $pid ]]; then kill -SIGTERM $pid; fi
+    if [[ -n $pid ]]; then kill -SIGTERM -- -$pid; fi
     wait $pid
     echo "Python process finished gracefully. Requeuing job..."
     if [[ $restarts -lt $max_restarts ]]; then
@@ -40,6 +47,7 @@ trap 'resubmit' SIGUSR1
 # --- 실행 명령어 변경 ---
 # OPTIMIZATION: 시간 측정을 위해 time 명령어 사용
 # DDP CHANGE: torchrun으로 분산 학습 실행, --run_name으로 실험 이름 명시
+set -m
 time torchrun --nproc_per_node=4 maisi_train_VAE.py \
     --model_config_path configs/config_maisi3d-rflow.json \
     --train_config_path configs/config_maisi_vae_train.json \
@@ -47,8 +55,16 @@ time torchrun --nproc_per_node=4 maisi_train_VAE.py \
     --cpus_per_task ${SLURM_CPUS_PER_TASK} \
     --resume &
 pid=$!
-
+set +m
 wait $pid
+
+echo "Training completed or terminated by signal."
+exit_code=$?
+
+if [[ $exit_code -ne 0 ]]; then
+  echo "Python exited with code $exit_code"
+  exit $exit_code
+fi
 
 echo "Training completed or terminated by signal."
 exit 0

@@ -2,8 +2,8 @@ import os
 import copy
 import yaml
 import json
-import pandas as pd
 import argparse
+import pandas as pd
 from monai.config import print_config
 
 print_config()
@@ -32,43 +32,15 @@ def load_config():
     parser.add_argument("--valid_label_dir", type=str, default=None, help="valid_label_path")
     parser.add_argument("--data_dir", type=str, default=None, help="data path")
     parser.add_argument("--embedding_dir", type=str, default="/leelabsg/data/ex_MAISI")
-    #parser.add_argument("--resume", action="store_true")
-    #parser.add_argument("--device", type=str, default="cuda")
     parser.add_argument("--run_name", type=str, default=None)
     args = parser.parse_args()
     args.run_name = get_run_name(args.run_name)
-    # config_dict = json.load(open(args.model_def_path, "r"))
-    # for k, v in config_dict.items():
-    #     setattr(args, k, v)
-    # config_train_dict = json.load(open(args.train_config_path, "r"))
-    # for k, v in config_train_dict["diffusion_unet_train"].items():
-    #     setattr(args, k, v)
-    #     #print(f"{k}: {v}")
-    # for k, v in config_train_dict["diffusion_unet_inference"].items():
-    #     setattr(args, k, v)
-    #    #print(f"{k}: {v}")
-    # for k, v in config_train_dict["custom_config"].items():
-    #     setattr(args, k, v)
     return args
 
-
-# logger = setup_logging("notebook")
 
 
 def main():
     args = load_config()
-    # device = torch.device(args.device)
-
-    # weight_dtype = torch.float32
-    # if args.weight_dtype == "fp16":
-    #     weight_dtype = torch.float16
-
-    # torch.manual_seed(args.seed)
-    # torch.backends.cuda.matmul.allow_tf32 = True
-    # torch.backends.cudnn.allow_tf32 = True
-    # torch.backends.cudnn.benchmark = True
-    # torch.backends.cudnn.deterministic = False
-    # set_determinism(seed=args.seed)
     print("[Config] Loaded hyperparameters:")
     print(yaml.dump(args, sort_keys=False))
 
@@ -117,11 +89,11 @@ def main():
     model_def_out = copy.deepcopy(model_def)
 
     env_config_out["data_base_dir"] = dataroot_dir
-    env_config_out["embedding_base_dir"] = os.path.join(work_dir, env_config_out["embedding_base_dir"])
+    env_config_out["embedding_base_dir"] = os.path.normpath(os.path.join(work_dir, env_config_out["embedding_base_dir"]))
     env_config_out["json_data_list"] = datalist_file
     env_config_out["val_json_data_list"] = val_datalist_file
-    env_config_out["model_dir"] = os.path.join(work_dir, env_config_out["model_dir"])
-    env_config_out["output_dir"] = os.path.join(work_dir, env_config_out["output_dir"])
+    env_config_out["model_dir"] = os.path.normpath(os.path.join(work_dir, env_config_out["model_dir"]))
+    env_config_out["output_dir"] = os.path.normpath(os.path.join(work_dir, env_config_out["output_dir"]))
     env_config_out["trained_autoencoder_path"] = args.pretrained_vae_path #.pth
 
     # Create necessary directories
@@ -134,7 +106,18 @@ def main():
         json.dump(env_config_out, f, sort_keys=True, indent=4)
 
     # Update model configuration for demo
-    train_config_out["diffusion_unet_train"]["n_epochs"] = 200
+    train_config_out["diffusion_unet_train"]["batch_size"] = 16
+    train_config_out["diffusion_unet_train"]["val_batch_size"] = 8
+    train_config_out["diffusion_unet_train"]["cache_rate"] = 0.1
+    train_config_out["diffusion_unet_train"]["lr"] = 0.0001
+    train_config_out["diffusion_unet_train"]["seed"] = 42
+    train_config_out["diffusion_unet_train"]["report_to"] = True
+    train_config_out["diffusion_unet_train"]["max_train_steps"] = 100000
+    train_config_out["diffusion_unet_train"]["num_valid"] = 1000
+    train_config_out["diffusion_unet_train"]["checkpointing_steps"] = 5000
+    train_config_out["diffusion_unet_train"]["validation_steps"] = 5000
+    train_config_out["diffusion_unet_inference"]["dim"] = [128,256,128]
+    train_config_out["diffusion_unet_inference"]["spacing"] = [1.421875,0.8515625,1.421875]
 
     train_config_filepath = os.path.join(work_dir, "config_maisi_diff_model.json")
     with open(train_config_filepath, "w") as f:

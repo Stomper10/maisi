@@ -293,26 +293,12 @@ def main():
         "--model_def", type=str, default="./configs/config_maisi.json", help="Path to model definition file"
     )
     parser.add_argument("--num_gpus", type=int, default=1, help="Number of GPUs to use for distributed training")
-    # parser.add_argument(
-    #     "--train_label_dir",
-    #     type=str,
-    #     default=None,
-    #     help="A training label dir.",
-    # )
     args = parser.parse_args()
-    # args.run_name = get_run_name(args.run_name)
-    # device = torch.device(args.device)
 
-    # weight_dtype = torch.float32
-    # if args.weight_dtype == "fp16":
-    #     weight_dtype = torch.float16
-
-    # torch.manual_seed(args.seed)
     torch.backends.cuda.matmul.allow_tf32 = True
     torch.backends.cudnn.allow_tf32 = True
     torch.backends.cudnn.benchmark = True
     torch.backends.cudnn.deterministic = False
-    # set_determinism(seed=args.seed)
 
     print("[Config] Loaded hyperparameters:")
     print(yaml.dump(args, sort_keys=False))

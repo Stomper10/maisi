@@ -27,11 +27,12 @@ from monai.data import CacheDataset, DataLoader, DistributedSampler
 
 from utils import count_parameters
 from scripts.transforms import VAE_Transform
-from scripts.utils import KL_loss, define_instance, dynamic_infer
+from scripts.utils import define_instance, dynamic_infer #, KL_loss
 from scripts.utils_plot import find_label_center_loc, get_xyz_plot
 
 warnings.filterwarnings("ignore")
-print_config()
+if os.environ.get("RANK", "0") == "0":
+    print_config()
 
 def setup_ddp(): # DDP CHANGE: 분산 환경 초기화 함수
     """Initializes the distributed process group."""
@@ -42,12 +43,18 @@ def cleanup_ddp(): # DDP CHANGE: 분산 환경 정리 함수
     """Cleans up the distributed process group."""
     dist.destroy_process_group()
 
+def atomic_save(state, path):
+    tmp = path + ".tmp"
+    torch.save(state, tmp)
+    os.replace(tmp, path)
+
 SHUTDOWN_REQUESTED = False
 def graceful_shutdown(signum, frame):
     global SHUTDOWN_REQUESTED
-    print(f"\n[!] Received signal {signum}. Requesting graceful shutdown...")
+    print(f"\n[!] Received signal {signum}. Requesting graceful shutdown...", flush=True)
     SHUTDOWN_REQUESTED = True
 signal.signal(signal.SIGTERM, graceful_shutdown)
+signal.signal(signal.SIGINT, graceful_shutdown)
 
 def get_run_name(manual_name=None, default_prefix="manual"):
     job_id = os.environ.get("SLURM_JOB_ID")
@@ -71,6 +78,8 @@ def load_config():
     parser.add_argument("--run_name", type=str, default=None)
     parser.add_argument("--cpus_per_task", type=int, default=8, help="Number of CPUs allocated per task by Slurm.")
     args = parser.parse_args()
+    if args.resume and not args.run_name:
+        raise ValueError("--resume requires --run_name to be specified.")
     args.run_name = get_run_name(args.run_name)
     config_dict = json.load(open(args.model_config_path, "r"))
     for k, v in config_dict.items():
@@ -137,6 +146,12 @@ def prepare_image_for_logging(image_tensor, center_loc):
     vis_img_uint8 = (vis_img_np * 255).astype(np.uint8)
     return wandb.Image(vis_img_uint8)
 
+def reduce_mean_scalar(x):
+    t = x.detach().reshape(1).to(torch.float32)
+    dist.all_reduce(t, op=dist.ReduceOp.SUM)
+    t /= dist.get_world_size()
+    return t.item()
+
 def main():
     setup_ddp() # DDP CHANGE: 분산 설정 초기화
     rank = int(os.environ["RANK"])
@@ -147,6 +162,9 @@ def main():
     device = torch.device(f"cuda:{local_rank}")
     weight_dtype = torch.float16 if args.weight_dtype == "fp16" else torch.float32
 
+    if rank == 0:
+        print(f"[Opt] Using gradient accumulation with {args.gradient_accumulation_steps} steps.")
+
     # OPTIMIZATION: 각 프로세스에 다른 시드를 주어 데이터 증강의 다양성 확보
     set_determinism(seed=args.seed + rank)
     # OPTIMIZATION: cudnn.benchmark는 입력 크기가 일정할 때 가장 효과적이므로 활성화
@@ -154,18 +172,14 @@ def main():
     torch.backends.cudnn.allow_tf32 = True
     torch.backends.cudnn.benchmark = True
     torch.backends.cudnn.deterministic = False
+    torch.set_float32_matmul_precision("high")
 
     if rank == 0:
-        run_name = args.run_name
         print("[Config] Loaded hyperparameters:")
         print(yaml.dump(vars(args), sort_keys=False))
         if args.report_to:
-            wandb.init(project="maisi_ex", config=args, name=run_name)
-            wandb.run.define_metric("step")
-            wandb.run.define_metric("train_ae/loss", step_metric="step")
-            wandb.run.define_metric("valid_ae/loss", step_metric="step")
-            wandb.run.define_metric("train_ae/lr", step_metric="step")
-        output_dir = os.path.join(args.output_dir, run_name)
+            wandb.init(project="MAISI_EX_DDP", config=args, name=args.run_name)
+        output_dir = os.path.join(args.output_dir, args.run_name)
         os.makedirs(output_dir, exist_ok=True)
     else:
         output_dir = None
@@ -202,15 +216,37 @@ def main():
 
     # Build dataloader
     if rank == 0: print(f"Total number of training data is {len(train_files)}.")
-    train_dataset = CacheDataset(data=train_files, transform=train_transform, cache_rate=args.cache, num_workers=args.cpus_per_task // world_size)
-    train_sampler = DistributedSampler(dataset=train_dataset, shuffle=True)
     workers_per_gpu = args.cpus_per_task // world_size # 각 프로세스가 사용할 수 있는 CPU 코어 수에 맞춰 num_workers 설정
-    dataloader_train = DataLoader(train_dataset, batch_size=args.batch_size, num_workers=workers_per_gpu, sampler=train_sampler, pin_memory=True, drop_last=True)
+    train_dataset = CacheDataset(data=train_files, transform=train_transform, cache_rate=args.cache, num_workers=workers_per_gpu)
+    train_sampler = DistributedSampler(dataset=train_dataset, shuffle=True)
+    dataloader_train = DataLoader(
+        train_dataset, 
+        batch_size=args.batch_size, 
+        num_workers=workers_per_gpu, 
+        sampler=train_sampler, 
+        pin_memory=True, 
+        drop_last=True,
+        persistent_workers=True,
+        prefetch_factor=2
+    )
     
-    if rank == 0: # DDP CHANGE: Validation은 rank 0에서만 진행하므로, sampler 불필요
-        print(f"Total number of validation data is {len(val_files)}.")
-        dataset_val = CacheDataset(data=val_files, transform=val_transform, cache_rate=args.cache, num_workers=workers_per_gpu)
-        dataloader_val = DataLoader(dataset_val, batch_size=args.val_batch_size, num_workers=workers_per_gpu, shuffle=False, pin_memory=True)
+    if rank == 0: print(f"Total number of validation data is {len(val_files)}.")
+    val_total = len(val_files)
+    per_rank = (val_total + world_size - 1) // world_size  # ceil
+    start = rank * per_rank
+    end = min(val_total, start + per_rank)
+    val_files_shard = val_files[start:end]
+    dataset_val = CacheDataset(data=val_files_shard, transform=val_transform, cache_rate=0.0, num_workers=workers_per_gpu)
+    dataloader_val = DataLoader(
+        dataset_val, 
+        batch_size=args.val_batch_size, 
+        num_workers=workers_per_gpu, 
+        pin_memory=True,
+        persistent_workers=True,
+        prefetch_factor=2
+    )
+    
+    if rank == 0:
         print("### Train Transform ###")
         for i, t in enumerate(train_transform.transform_dict["mri"].transforms):
             print(f"[{i}] {t}")
@@ -228,18 +264,32 @@ def main():
         norm="INSTANCE",
     ).to(device)
 
-    if rank == 0: print("Warming up models for torch.compile() with AMP...")
-    dummy_input = torch.randn(1, 1, *args.patch_size, device=device, dtype=weight_dtype)
-    with autocast(device_type="cuda", dtype=torch.float16, enabled=args.amp):
-        autoencoder(dummy_input)
-        discriminator(dummy_input)
+    optimizer_g = torch.optim.AdamW(params=autoencoder.parameters(), lr=args.lr, weight_decay=1e-5, eps=1e-6 if args.amp else 1e-8)
+    optimizer_d = torch.optim.AdamW(params=discriminator.parameters(), lr=args.lr, weight_decay=1e-5, eps=1e-6 if args.amp else 1e-8)
+    total_opt_steps = (args.max_train_steps - 100000 + args.gradient_accumulation_steps - 1) // args.gradient_accumulation_steps ### s2
+    scheduler_g = lr_scheduler.CosineAnnealingLR(optimizer_g, T_max=total_opt_steps)
+    scheduler_d = lr_scheduler.CosineAnnealingLR(optimizer_d, T_max=total_opt_steps)
+    scaler_g, scaler_d = (GradScaler(), GradScaler()) if args.amp else (None, None)
+
+    start_step, best_val_loss = 0, float("inf")
+    if args.resume:
+        output_dir_for_resume = os.path.join(args.output_dir, args.run_name)
+        start_step, best_val_loss = resume_from_latest(
+            autoencoder, discriminator, optimizer_g, optimizer_d,
+            scheduler_g, scheduler_d, scaler_g, scaler_d, output_dir_for_resume, device)
+    dist.barrier(device_ids=[local_rank])
 
     # OPTIMIZATION: torch.compile로 모델 컴파일하여 연산 가속화 (PyTorch 2.0+ 필수)
     if rank == 0: print("Compiling models with torch.compile()...")
     autoencoder = torch.compile(autoencoder)
     discriminator = torch.compile(discriminator)
-    autoencoder = DDP(autoencoder, device_ids=[local_rank], find_unused_parameters=True)
-    discriminator = DDP(discriminator, device_ids=[local_rank], find_unused_parameters=True)
+    dist.barrier(device_ids=[local_rank])
+    autoencoder = DDP(autoencoder, device_ids=[local_rank], find_unused_parameters=False)
+    discriminator = DDP(discriminator, device_ids=[local_rank], find_unused_parameters=False)
+
+    sync_vec = torch.tensor([start_step, float(best_val_loss)], device=device, dtype=torch.float32)
+    dist.broadcast(sync_vec, src=0)
+    start_step, best_val_loss = int(sync_vec[0].item()), float(sync_vec[1].item())
 
     # Training config
     if args.recon_loss == "l2":
@@ -248,29 +298,7 @@ def main():
         intensity_loss = L1Loss(reduction="mean")
     adv_loss = PatchAdversarialLoss(criterion="least_squares")
     loss_perceptual = PerceptualLoss(spatial_dims=3, network_type="squeeze", is_fake_3d=True, fake_3d_ratio=0.2).eval().to(device)
-    optimizer_g = torch.optim.AdamW(params=autoencoder.parameters(), lr=args.lr, weight_decay=1e-5, eps=1e-6 if args.amp else 1e-8)
-    optimizer_d = torch.optim.AdamW(params=discriminator.parameters(), lr=args.lr, weight_decay=1e-5, eps=1e-6 if args.amp else 1e-8)
-    scheduler_g = lr_scheduler.CosineAnnealingLR(optimizer_g, T_max=args.max_train_steps)
-    scheduler_d = lr_scheduler.CosineAnnealingLR(optimizer_d, T_max=args.max_train_steps)
-    scaler_g, scaler_d = (GradScaler(), GradScaler()) if args.amp else (None, None)
-
-    start_step, best_val_recon_epoch_loss = 0, float("inf")
-    if args.resume:
-        run_name_for_resume = args.run_name # 실제 실행시 run_name을 명시해야 함
-        output_dir_for_resume = os.path.join(args.output_dir, run_name_for_resume)
-        
-        # DDP에서는 DDP로 감싸기 전에 모델 가중치를 로드해야 함. 현재 코드는 이 순서를 따르고 있음.
-        # DDP 래핑 전에 호출해야 하므로, autoencoder.module이 아닌 autoencoder를 전달
-        if rank == 0:
-             start_step, best_val_recon_epoch_loss = resume_from_latest(
-                autoencoder.module, discriminator.module, optimizer_g, optimizer_d,
-                scheduler_g, scheduler_d, scaler_g, scaler_d, output_dir_for_resume, device)
-        
-        # DDP CHANGE: rank 0에서 읽은 step과 loss 값을 모든 프로세스에 동기화
-        sync_data = torch.tensor([start_step, best_val_recon_epoch_loss], dtype=torch.float32, device=device)
-        dist.broadcast(sync_data, src=0)
-        start_step, best_val_recon_epoch_loss = int(sync_data[0].item()), sync_data[1].item()
-        
+    
     if rank == 0:
         param_counts = count_parameters(autoencoder.module)
         print(f"### autoencoder's Trainable parameters: {param_counts['trainable']:,}")
@@ -286,8 +314,6 @@ def main():
             epoch += 1
             
     train_iter = infinite_loader(dataloader_train, train_sampler)
-
-    # --- 학습 루프 ---
     progress_bar = trange(start_step, args.max_train_steps + 1,
                           desc=f"Training on Rank {rank}",
                           initial=start_step, total=args.max_train_steps + 1,
@@ -296,38 +322,36 @@ def main():
     for step in progress_bar:
         autoencoder.train()
         discriminator.train()
-        
         batch = next(train_iter)
         # OPTIMIZATION: non_blocking=True로 데이터 전송과 연산 오버랩 시도
         images = batch["image"].to(device, non_blocking=True).contiguous()
 
-        optimizer_g.zero_grad(set_to_none=True)
-        optimizer_d.zero_grad(set_to_none=True)
-
         with autocast(device_type="cuda", dtype=torch.float16, enabled=args.amp):
             reconstruction, z_mu, z_sigma = autoencoder(images)
-            z_sigma = torch.clamp(z_sigma, min=1e-6)
+
+        z_mu_f = z_mu.float()
+        z_sigma_f = torch.clamp(z_sigma.float(), min=1e-8)
+        logvar = 2.0 * torch.log(z_sigma_f)                # σ -> log σ²
+        logvar = torch.clamp(logvar, min=-30.0, max=10.0)  # 상한 10 정도로 낮추는 게 안전
+        kl = 0.5 * (torch.exp(logvar) + z_mu_f**2 - 1.0 - logvar)
+        kl_loss = kl.mean()
+
+        with autocast(device_type="cuda", dtype=torch.float16, enabled=args.amp):
             losses = {
                 "recons_loss": intensity_loss(reconstruction, images),
-                "kl_loss": KL_loss(z_mu, z_sigma),
+                "kl_loss": kl_loss,
                 "p_loss": loss_perceptual(reconstruction.float(), images.float()),
             }
             logits_fake = discriminator(reconstruction.contiguous().float())[-1]
             generator_loss = adv_loss(logits_fake, target_is_real=True, for_discriminator=False)
             loss_g = losses["recons_loss"] + args.kl_weight * losses["kl_loss"] + \
                      args.perceptual_weight * losses["p_loss"] + args.adv_weight * generator_loss
-        
+            loss_g = loss_g / args.gradient_accumulation_steps
+            
         if args.amp:
             scaler_g.scale(loss_g).backward()
-            scaler_g.unscale_(optimizer_g)
-            clip_grad_norm_(autoencoder.parameters(), 1.0)     # clipping
-            scaler_g.step(optimizer_g)
-            scaler_g.update()
         else:
             loss_g.backward()
-            clip_grad_norm_(autoencoder.parameters(), 1.0)     # clipping
-            optimizer_g.step()
-        scheduler_g.step()
 
         with autocast(device_type="cuda", dtype=torch.float16, enabled=args.amp):
             logits_fake = discriminator(reconstruction.contiguous().detach())[-1]
@@ -335,126 +359,196 @@ def main():
             logits_real = discriminator(images.contiguous().detach())[-1]
             loss_d_real = adv_loss(logits_real, target_is_real=True, for_discriminator=True)
             loss_d = (loss_d_fake + loss_d_real) * 0.5
+            loss_d = loss_d / args.gradient_accumulation_steps
 
         if args.amp:
             scaler_d.scale(loss_d).backward()
-            scaler_d.unscale_(optimizer_d)
-            clip_grad_norm_(discriminator.parameters(), 1.0)     # clipping
-            scaler_d.step(optimizer_d)
-            scaler_d.update()
         else:
             loss_d.backward()
-            clip_grad_norm_(discriminator.parameters(), 1.0)     # clipping
-            optimizer_d.step()
-        scheduler_d.step()
 
-        # DDP CHANGE: 모든 GPU의 loss를 평균내어 로그 기록 (선택적이지만 정확성을 위해 권장)
-        dist.all_reduce(loss_g, op=dist.ReduceOp.AVG)
-        dist.all_reduce(loss_d, op=dist.ReduceOp.AVG)
+        if (step + 1) % args.gradient_accumulation_steps == 0:
+            # Generator 업데이트
+            if args.amp:
+                scaler_g.unscale_(optimizer_g)
+                clip_grad_norm_(autoencoder.parameters(), 1.0)
+                scaler_g.step(optimizer_g)
+                scaler_g.update()
+            else:
+                clip_grad_norm_(autoencoder.parameters(), 1.0)
+                optimizer_g.step()
+            scheduler_g.step()
+            optimizer_g.zero_grad(set_to_none=True)
+
+            # Discriminator 업데이트
+            if args.amp:
+                scaler_d.unscale_(optimizer_d)
+                clip_grad_norm_(discriminator.parameters(), 1.0)
+                scaler_d.step(optimizer_d)
+                scaler_d.update()
+            else:
+                clip_grad_norm_(discriminator.parameters(), 1.0)
+                optimizer_d.step()
+            scheduler_d.step()
+            optimizer_d.zero_grad(set_to_none=True)
+
+        # DDP CHANGE: 모든 GPU의 loss를 평균내어 로그 기록
+        lg = reduce_mean_scalar(loss_g) * args.gradient_accumulation_steps
+        ld = reduce_mean_scalar(loss_d) * args.gradient_accumulation_steps
+        avg_recons_loss = reduce_mean_scalar(losses["recons_loss"]) * args.gradient_accumulation_steps
+        avg_kl_loss = reduce_mean_scalar(losses["kl_loss"]) * args.gradient_accumulation_steps
+        avg_p_loss = reduce_mean_scalar(losses["p_loss"]) * args.gradient_accumulation_steps
+        avg_gen_loss = reduce_mean_scalar(generator_loss) * args.gradient_accumulation_steps
+        avg_dfake_loss = reduce_mean_scalar(loss_d_fake) * args.gradient_accumulation_steps
+        avg_dreal_loss = reduce_mean_scalar(loss_d_real) * args.gradient_accumulation_steps
 
         if rank == 0:
-            progress_bar.set_postfix({'Total_g_loss': f"{loss_g.item():.4f}", 'Total_d_loss': f"{loss_d.item():.4f}"})
+            progress_bar.set_postfix({'Total_g_loss': f"{lg:.4f}", 'Total_d_loss': f"{ld:.4f}"})
             if args.report_to and step % 100 == 0: # 로그 기록 빈도 조절
                 log_data = {
                     "train/learning_rate": scheduler_g.get_last_lr()[0],
-                    "train/loss_g_total": loss_g.item(),
-                    "train/loss_d_total": loss_d.item(),
+                    "train/loss_g_total": lg,
+                    "train/loss_d_total": ld,
+                    "train/generator/recons_loss": avg_recons_loss,
+                    "train/generator/kl_loss": avg_kl_loss,
+                    "train/generator/p_loss": avg_p_loss,
+                    "train/discriminator/adv_g_loss": avg_gen_loss,
+                    "train/discriminator/d_fake_loss": avg_dfake_loss,
+                    "train/discriminator/d_real_loss": avg_dreal_loss,
                 }
-                for loss_name, loss_value in losses.items():
-                    log_data[f"train/generator/{loss_name}"] = loss_value.item()
-                log_data["train/discriminator/adv_g_loss"] = generator_loss.item()
-                log_data["train/discriminator/d_fake_loss"] = loss_d_fake.item()
-                log_data["train/discriminator/d_real_loss"] = loss_d_real.item()
                 wandb.log(log_data, step=step)
 
-            # --- 체크포인트 저장 및 Validation ---
-            is_time_to_save = (step % args.checkpointing_steps == 0 and step > start_step)
-            if is_time_to_save or SHUTDOWN_REQUESTED:
-                state = {
-                    # DDP CHANGE: .module을 통해 원본 모델의 state_dict 저장
-                    "autoencoder": autoencoder.module.state_dict(),
-                    "discriminator": discriminator.module.state_dict(),
-                    "optimizer_g": optimizer_g.state_dict(),
-                    "optimizer_d": optimizer_d.state_dict(),
-                    "scheduler_g": scheduler_g.state_dict(),
-                    "scheduler_d": scheduler_d.state_dict(),
-                    "step": step,
-                    "best_val_loss": float(best_val_recon_epoch_loss),
-                }
-                if args.amp:
-                    state["scaler_g"] = scaler_g.state_dict()
-                    state["scaler_d"] = scaler_d.state_dict()
-                
-                ckpt_dir = os.path.join(output_dir, f"checkpoint-{step}")
-                os.makedirs(ckpt_dir, exist_ok=True)
-                torch.save(state, os.path.join(ckpt_dir, "model.pt"))
-                print(f"\nSaved checkpoint to {ckpt_dir}", flush=True)
-                
-                if SHUTDOWN_REQUESTED:
-                    print(f"Graceful shutdown: Final checkpoint saved to {ckpt_dir}. Exiting.", flush=True)
-                    break # 루프 종료
+        did_validate = False
+        if step % args.validation_steps == 0 and step > start_step:
+            did_validate = True
+            autoencoder.eval()
+            val_epoch_losses = {"recons_loss": 0, "kl_loss": 0, "p_loss": 0}
+            num_val_batches_local = 0
+            val_inferer = SlidingWindowInferer(
+                roi_size=args.val_sliding_window_patch_size, 
+                sw_batch_size=1, 
+                overlap=0.5, 
+                device=device, #torch.device("cpu"),
+                sw_device=device
+            )            
+            with torch.no_grad():
+                for val_batch in dataloader_val:
+                    val_images = val_batch["image"].to(device)
+                    # DDP CHANGE: .module을 통해 원본 모델로 추론
+                    with autocast(device_type="cuda", dtype=torch.float16, enabled=args.amp):
+                        reconstruction, z_mu_val, z_sigma_val = dynamic_infer(val_inferer, autoencoder.module, val_images)
 
-            if step % args.validation_steps == 0 and step > start_step:
-                autoencoder.eval()
-                val_epoch_losses = {"recons_loss": 0, "kl_loss": 0, "p_loss": 0}
-                val_inferer = SlidingWindowInferer(
-                    roi_size=args.val_sliding_window_patch_size, 
-                    sw_batch_size=1, 
-                    overlap=0.5, 
-                    device=device, #torch.device("cpu"), 
-                    sw_device=device
-                )
-                
-                with torch.no_grad():
-                    for val_batch in dataloader_val:
-                        val_images = val_batch["image"]
-                        # DDP CHANGE: .module을 통해 원본 모델로 추론
-                        with autocast(device_type="cuda", dtype=torch.float16, enabled=args.amp):
-                            reconstruction, z_mu_val, z_sigma_val = dynamic_infer(val_inferer, autoencoder.module, val_images)
-                            z_sigma_val = torch.clamp(z_sigma_val, min=1e-6)
-                        reconstruction = reconstruction.to(device)
-                        val_images = val_images.to(device)
-                        val_epoch_losses["recons_loss"] += intensity_loss(reconstruction, val_images).item()
-                        val_epoch_losses["kl_loss"] += KL_loss(z_mu_val, z_sigma_val).item()
-                        val_epoch_losses["p_loss"] += loss_perceptual(reconstruction.float(), val_images.float()).item()
-                
-                for key in val_epoch_losses:
-                    val_epoch_losses[key] /= len(dataloader_val)
+                    z_mu_val_f = z_mu_val.float()
+                    z_sigma_val_f = torch.clamp(z_sigma_val.float(), min=1e-8)
+                    logvar_val = 2.0 * torch.log(z_sigma_val_f)                # σ -> log σ²
+                    logvar_val = torch.clamp(logvar_val, min=-30.0, max=10.0)  # 상한 10 정도로 낮추는 게 안전
+                    kl_val = 0.5 * (torch.exp(logvar_val) + z_mu_val_f**2 - 1.0 - logvar_val)
+                    kl_loss_val = kl_val.mean().item()
+                    
+                    reconstruction = reconstruction.to(device)
+                    val_images = val_images.to(device)
+                    val_epoch_losses["recons_loss"] += intensity_loss(reconstruction, val_images).item()
+                    val_epoch_losses["kl_loss"] += kl_loss_val
+                    val_epoch_losses["p_loss"] += loss_perceptual(reconstruction.float(), val_images.float()).item()
+                    num_val_batches_local += 1
 
-                val_loss_g = val_epoch_losses["recons_loss"] + \
-                             args.kl_weight * val_epoch_losses["kl_loss"] + \
-                             args.perceptual_weight * val_epoch_losses["p_loss"]
-                
-                print(f"\nStep {step} Total Val Loss: {val_loss_g:.4f}, Details: {val_epoch_losses}")
+            val_metrics = torch.tensor(
+                [val_epoch_losses["recons_loss"], val_epoch_losses["kl_loss"], val_epoch_losses["p_loss"], num_val_batches_local],
+                device=device
+            )
+            dist.all_reduce(val_metrics, op=dist.ReduceOp.SUM)
+        
+            total_batches = val_metrics[3].item()
+            avg_recon_loss = val_metrics[0].item() / total_batches if total_batches > 0 else 0
+            avg_kl_loss = val_metrics[1].item() / total_batches if total_batches > 0 else 0
+            avg_p_loss = val_metrics[2].item() / total_batches if total_batches > 0 else 0
+            final_val_losses = {"recons_loss": avg_recon_loss, "kl_loss": avg_kl_loss, "p_loss": avg_p_loss}
+            val_loss_g = final_val_losses["recons_loss"] + \
+                         args.kl_weight * final_val_losses["kl_loss"] + \
+                         args.perceptual_weight * final_val_losses["p_loss"]
 
+            if rank == 0:                
+                print(f"\nStep {step} Total Val Loss (Avg across all ranks): {val_loss_g:.4f}, Details: {final_val_losses}")
                 if args.report_to:
                     log_data = {
                         "valid/total_loss": val_loss_g,
-                        "valid/recon_loss": val_epoch_losses["recons_loss"],
-                        "valid/kl_loss": val_epoch_losses["kl_loss"],
-                        "valid/p_loss": val_epoch_losses["p_loss"],
-                        "valid/scale_factor": (1.0 / z_mu_val.flatten().std()).item()
+                        "valid/recon_loss": final_val_losses["recons_loss"],
+                        "valid/kl_loss": final_val_losses["kl_loss"],
+                        "valid/p_loss": final_val_losses["p_loss"],
                     }
-                    center_loc = find_label_center_loc(val_images[0, 0, ...])
-                    log_data["valid/original_image"] = prepare_image_for_logging(val_images[0], center_loc)
-                    log_data["valid/reconstructed_image"] = prepare_image_for_logging(reconstruction[0], center_loc)
+                    if num_val_batches_local > 0: # scale_factor와 이미지는 마지막 배치의 결과만 참고용으로 로깅
+                        std = z_mu_val.detach().float().flatten().std().clamp(min=1e-8)
+                        log_data["valid/scale_factor"] = (1.0 / std).item()
+                        center_loc = find_label_center_loc(val_images[0, 0, ...])
+                        log_data["valid/original_image"] = prepare_image_for_logging(val_images[0], center_loc)
+                        log_data["valid/reconstructed_image"] = prepare_image_for_logging(reconstruction[0], center_loc)
                     wandb.log(log_data, step=step)
-                    
-        dist.barrier() # wait for rank 0 valid process
-        shutdown_tensor = torch.tensor([0], device=device)
-        if rank == 0 and SHUTDOWN_REQUESTED:
-            shutdown_tensor[0] = 1
+                
+                if val_loss_g < best_val_loss:
+                    torch.cuda.synchronize(device)
+                    autoencoder_state_dict = autoencoder.module._orig_mod.state_dict()
+                    discriminator_state_dict = discriminator.module._orig_mod.state_dict()
+                    best_val_loss = float(val_loss_g)
+                    state = {
+                        "autoencoder": autoencoder_state_dict,
+                        "discriminator": discriminator_state_dict,
+                        "optimizer_g": optimizer_g.state_dict(),
+                        "optimizer_d": optimizer_d.state_dict(),
+                        "scheduler_g": scheduler_g.state_dict(),
+                        "scheduler_d": scheduler_d.state_dict(),
+                        "step": step,
+                        "best_val_loss": best_val_loss,
+                    }
+                    if args.amp:
+                        state["scaler_g"] = scaler_g.state_dict()
+                        state["scaler_d"] = scaler_d.state_dict()
+                    best_dir = os.path.join(output_dir, "best-checkpoint")
+                    os.makedirs(best_dir, exist_ok=True)
+                    atomic_save(state, os.path.join(best_dir, "model.pt"))
+                    print(f"[best] updated at step {step}: {best_val_loss:.6f}", flush=True)
+                else:
+                    print(f"[not best] not updated at step {step}: {val_loss_g:.6f}", flush=True)
+
+            _best = torch.tensor([best_val_loss], device=device, dtype=torch.float32)
+            dist.broadcast(_best, src=0)
+            best_val_loss = float(_best.item())
+
+        # --- 체크포인트 저장 및 Validation ---
+        is_time_to_save = (step % args.checkpointing_steps == 0 and step > start_step)
+        if (is_time_to_save or SHUTDOWN_REQUESTED) and rank == 0:
+            torch.cuda.synchronize(device)
+            autoencoder_state_dict = autoencoder.module._orig_mod.state_dict()
+            discriminator_state_dict = discriminator.module._orig_mod.state_dict()
+            state = {
+                "autoencoder": autoencoder_state_dict,
+                "discriminator": discriminator_state_dict,
+                "optimizer_g": optimizer_g.state_dict(),
+                "optimizer_d": optimizer_d.state_dict(),
+                "scheduler_g": scheduler_g.state_dict(),
+                "scheduler_d": scheduler_d.state_dict(),
+                "step": step,
+                "best_val_loss": float(best_val_loss),
+            }
+            if args.amp:
+                state["scaler_g"] = scaler_g.state_dict()
+                state["scaler_d"] = scaler_d.state_dict()
+            ckpt_dir = os.path.join(output_dir, f"checkpoint-{step}")
+            os.makedirs(ckpt_dir, exist_ok=True)
+            atomic_save(state, os.path.join(ckpt_dir, "model.pt"))
+            print(f"\nSaved checkpoint to {ckpt_dir}", flush=True)
+
+        shutdown_tensor = torch.tensor([1 if (rank == 0 and SHUTDOWN_REQUESTED) else 0], device=device)
         dist.broadcast(shutdown_tensor, src=0)
-        if shutdown_tensor[0] == 1:
+        if shutdown_tensor.item() == 1:
             if rank == 0:
                 print("Shutdown signal received and synced across all ranks. Exiting training loop gracefully.")
             break
+        if did_validate:
+            dist.barrier(device_ids=[local_rank])
 
     if SHUTDOWN_REQUESTED:
         sys.exit(0)
     
-    # DDP CHANGE: 모든 프로세스가 끝날 때까지 대기 후 정리
-    dist.barrier()
+    dist.barrier(device_ids=[local_rank]) # DDP CHANGE: 모든 프로세스가 끝날 때까지 대기 후 정리
     cleanup_ddp()
 
 if __name__ == '__main__':

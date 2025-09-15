@@ -236,7 +236,7 @@ def run_inference(
             output_size[2] // divisor,
         ),
         device=device,
-    )
+    ) * args.diffusion_unet_inference["temperature"]
     logger.info(f"noise: {noise.device}, {noise.dtype}, {type(noise)}")
 
     image = noise
@@ -287,51 +287,28 @@ def run_inference(
             if not isinstance(noise_scheduler, RFlowScheduler):
                 image, _ = noise_scheduler.step(model_output, t, image)  # type: ignore
             else:
-                image, _ = noise_scheduler.step(model_output, t, image, next_t)  # type: ignore
+                image, _ = noise_scheduler.step(model_output, t, image, next_t, args.diffusion_unet_inference["stochastic_scale"])  # type: ignore
 
         print(f"[latent] min={image.min().item():.3f}, max={image.max().item():.3f}, mean={image.mean().item():.3f}, std={image.std().item():.3f}") ###
-        inferer = SlidingWindowInferer(
-            roi_size=[16, 16, 16], # [80, 80, 80]
-            sw_batch_size=1,
-            progress=True,
-            mode="gaussian",
-            overlap=0.25, # 0.4
-            sw_device=device,
-            device=device,
-        )
-        synthetic_images = dynamic_infer(inferer, recon_model, image)
+        # inferer = SlidingWindowInferer(
+        #     roi_size=[16, 16, 16], # [80, 80, 80]
+        #     sw_batch_size=1,
+        #     progress=True,
+        #     mode="gaussian",
+        #     overlap=0.25, # 0.4
+        #     sw_device=device,
+        #     device=device,
+        # )
+        # synthetic_images = dynamic_infer(inferer, recon_model, image)
+        synthetic_images = recon_model(image)
         data = synthetic_images.squeeze().cpu().detach().numpy() #.astype(np.float32) ###
-        # print(f"[decoded] dtype={data.dtype}, shape={data.shape}")
-        # print(f"min={data.min()}, max={data.max()}, mean={data.mean()}")
-        # try:
-        #     std_safe = np.sqrt(np.mean((data - data.mean()) ** 2))
-        #     print(f"std_safe: {std_safe}")
-        # except Exception as e:
-        #     print(f"std_safe computation failed: {e}")
-        # a_min, a_max, b_min, b_max = -1000, 1000, 0, 1
-        # data = (data - b_min) / (b_max - b_min) * (a_max - a_min) + a_min
-        # print(f"[final before clip] min={data.min().item()}, max={data.max().item()}, mean={data.mean().item()}, std={data.std().item()}")
-        # data = np.clip(data, a_min, a_max)
-        # Float32 변환은 이미 적용됐다고 가정
-        # 더 좁은 범위의 클리핑
-        # vmin, vmax = np.percentile(data, [2, 98])  # or even [5, 95] 실험해도 좋아
-        # print(f"[rescale] vmin={vmin:.2f}, vmax={vmax:.2f}")
-
-        # # 먼저 클립
-        # data = np.clip(data, vmin, vmax)
-        # # MRI 기준으로 dynamic range를 줄이기 (예: [-500, 500])
-        # a_min, a_max = -500, 500
-        # data = (data - vmin) / (vmax - vmin) * (a_max - a_min) + a_min
-        # a_min, a_max, b_min, b_max = -1000, 1000, 0, 1
-        # data = (data - b_min) / (b_max - b_min) * (a_max - a_min) + a_min
-        # data = np.clip(data, a_min, a_max)
-        v_min, v_max = np.percentile(data, 0), np.percentile(data, 99.5)
-        b_min, b_max = 0.0, 1.0
-        if v_max == v_min:
-            return np.zeros_like(data, dtype=np.float32)
-        data = (data - v_min) / (v_max - v_min)
-        data = data * (b_max - b_min) + b_min
-        return np.float32(data) # np.int16(data) normed
+        # v_min, v_max = np.percentile(data, 0), np.percentile(data, 99.5)
+        # b_min, b_max = 0.0, 1.0
+        # if v_max == v_min:
+        #     return np.zeros_like(data, dtype=np.float32)
+        # data = (data - v_min) / (v_max - v_min)
+        # data = data * (b_max - b_min) + b_min
+        return data.astype(np.float32) # np.int16(data) normed
 
 def save_image(
     data: np.ndarray,
@@ -360,7 +337,7 @@ def save_image(
     logger.info(f"Saved {output_path}.")
 
 @torch.inference_mode()
-def diff_model_infer(env_config_path: str, model_config_path: str, model_def_path: str, num_gpus: int) -> None:
+def diff_model_infer(env_config_path: str, model_config_path: str, model_def_path: str, num_gpus: int, seed: int) -> None:
     """
     Main function to run the diffusion model inference.
 
@@ -372,11 +349,12 @@ def diff_model_infer(env_config_path: str, model_config_path: str, model_def_pat
     args = load_config(env_config_path, model_config_path, model_def_path)
     local_rank, world_size, device = initialize_distributed(num_gpus)
     logger = setup_logging("inference")
-    random_seed = set_random_seed(
-        args.diffusion_unet_inference["random_seed"] + local_rank
-        if args.diffusion_unet_inference["random_seed"]
-        else None
-    )
+    # random_seed = set_random_seed(
+    #     args.diffusion_unet_inference["random_seed"] + local_rank
+    #     if args.diffusion_unet_inference["random_seed"]
+    #     else None
+    # )
+    random_seed = set_random_seed(seed)
     logger.info(f"Using {device} of {world_size} with random seed: {random_seed}")
 
     output_size = tuple(args.diffusion_unet_inference["dim"])
@@ -456,7 +434,7 @@ def diff_model_infer(env_config_path: str, model_config_path: str, model_def_pat
     )
 
     timestamp = datetime.now().strftime("%Y%m%d%H%M%S")
-    output_path = "{0}/{1}_seed{2}_size{3:d}x{4:d}x{5:d}_spacing{6:.2f}x{7:.2f}x{8:.2f}_{9}_rank{10}.nii.gz".format(
+    output_path = "{0}/{1}_seed{2}_size{3:d}x{4:d}x{5:d}_spacing{6:.2f}x{7:.2f}x{8:.2f}_{9}_rank{10}.nii.gz".format( ###
         args.output_dir,
         output_prefix,
         random_seed,
@@ -504,11 +482,17 @@ if __name__ == "__main__":
         default=1,
         help="Number of GPUs to use for distributed inference",
     )
+    parser.add_argument(
+        "--ex_seed",
+        type=int,
+        default=1,
+        help="Number of GPUs to use for distributed inference",
+    )
 
     args = parser.parse_args()
 
-    for i in range(100):
-        data = diff_model_infer(args.env_config, args.train_config, args.model_def, args.num_gpus)
+    for i in range(args.ex_seed, 400+args.ex_seed):
+        data = diff_model_infer(args.env_config, args.train_config, args.model_def, args.num_gpus, i)
     # print(f"[final after clip]: {data.min()}, max: {data.max()}, mean: {data.mean()}, std: {data.std()}")
 
     # img = nib.load("/leelabsg/data/20252_unzip/3651056_20252_2_0/T1/T1_brain_to_MNI.nii.gz")
@@ -518,6 +502,8 @@ if __name__ == "__main__":
     args = load_config(args.env_config, args.train_config, args.model_def)
     input_dir = args.output_dir
     output_dir = os.path.join(args.output_dir, "slices")
+    # input_dir = "/leelabsg/data/ex_MAISI/E0_UKB/predictions/naive"
+    # output_dir = "/leelabsg/data/ex_MAISI/E0_UKB/predictions/naive/slices"
     os.makedirs(output_dir, exist_ok=True)
 
     # 변환 파이프라인 (spacing + resize)
@@ -543,23 +529,16 @@ if __name__ == "__main__":
     
     def save_wandb_style_xyz_plot(tensor_1chw, filename, output_dir):
         center = find_label_center_loc(tensor_1chw[0])  # (H, W, D)
+        center = torch.tensor([89,110,89])
         vis_image = get_xyz_plot(tensor_1chw, center, mask_bool=False)
         vis_image = (vis_image - vis_image.min()) / (vis_image.max() - vis_image.min() + 1e-8)
         vis_image = (vis_image * 255).astype(np.uint8)
-        # ✅ 1st: percentile-based intensity clipping (e.g., 1% ~ 99%)
-        # vmin, vmax = np.percentile(vis_image, [1, 99])
-        # vis_image = np.clip(vis_image, vmin, vmax)
-
-        # # ✅ 2nd: normalize to 0-255 for display
-        # vis_image = (vis_image - vis_image.min()) / (vis_image.max() - vis_image.min() + 1e-8)
-        # vis_image = (vis_image * 255).astype(np.uint8)
-
         save_path = os.path.join(output_dir, f"{filename}_xyz.png")
         plt.imsave(save_path, vis_image)
         print(f"✅ Saved: {save_path}")
 
     # 처리 시작
-    nii_paths = glob.glob(os.path.join(input_dir, "*.nii.gz"))
+    nii_paths = glob.glob(os.path.join(input_dir, "*.nii.gz"))[:1000]
     print(f"Found {len(nii_paths)} files.")
 
     for nii_path in nii_paths:

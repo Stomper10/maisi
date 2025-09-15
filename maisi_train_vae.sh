@@ -10,7 +10,7 @@
 #SBATCH --cpus-per-task=8
 #SBATCH --signal=B:SIGUSR1@30
 #SBATCH --open-mode=append
-#SBATCH -o /shared/s1/lab06/wonyoung/maisi/logs/%x-%j.txt
+#SBATCH -o /shared/s1/lab06/wonyoung/maisi/logs_ex/%x-%j.txt
 
 source /home/s1/wonyoungjang/.bashrc
 source /home/s1/wonyoungjang/anaconda3/bin/activate

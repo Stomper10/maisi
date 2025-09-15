@@ -58,7 +58,6 @@ def load_config():
     parser.add_argument("--model_def_path", type=str, default="/shared/s1/lab06/wonyoung/maisi/configs/config_maisi3d-rflow_brats.json")
     parser.add_argument("--train_config_path", type=str, default="/shared/s1/lab06/wonyoung/maisi/configs/config_maisi_diff_model_brats.json")
     parser.add_argument("--env_config_path", type=str, default="/shared/s1/lab06/wonyoung/maisi/configs/environment_maisi_diff_model.json")
-    #parser.add_argument("--train_label_dir", type=str, default=None, help="train_label_path")
     parser.add_argument("--train_data_dir", type=str, default=None, help="train data path")
     parser.add_argument("--valid_data_dir", type=str, default=None, help="valid data path")
     parser.add_argument("--embedding_dir", type=str, default="/leelabsg/data/ex_MAISI")
@@ -69,18 +68,6 @@ def load_config():
 
 def main():
     args = load_config()
-    # device = torch.device(args.device)
-
-    # weight_dtype = torch.float32
-    # if args.weight_dtype == "fp16":
-    #     weight_dtype = torch.float16
-
-    # torch.manual_seed(args.seed)
-    # torch.backends.cuda.matmul.allow_tf32 = True
-    # torch.backends.cudnn.allow_tf32 = True
-    # torch.backends.cudnn.benchmark = True
-    # torch.backends.cudnn.deterministic = False
-    # set_determinism(seed=args.seed)
     print("[Config] Loaded hyperparameters:")
     print(yaml.dump(args, sort_keys=False))
 
@@ -90,26 +77,6 @@ def main():
     maisi_version = args.model_def_path.split("/")[-1]
     include_body_region = model_def["include_body_region"]
     print(f"MAISI version is {maisi_version}, whether to use body_region is {include_body_region}")
-
-    # Data
-    # train_files = {
-    #     "training": [
-    #         {
-    #             "image": os.path.join(args.train_data_dir, file_dir, file_dir+"-t1n.nii.gz"),
-    #             "label": os.path.join(args.train_data_dir, file_dir, file_dir+"-seg.nii.gz"),
-    #         }
-    #         for file_dir in os.listdir(args.train_data_dir)
-    #     ]
-    # }
-    # valid_files = {
-    #     "validation": [
-    #         {
-    #             "image": os.path.join(args.valid_data_dir, file_dir, file_dir+"-t1n.nii.gz"),
-    #             "label": os.path.join(args.valid_data_dir, file_dir, file_dir+"-seg.nii.gz"),
-    #         }
-    #         for file_dir in os.listdir(args.valid_data_dir)
-    #     ]
-    # }
     train_files = build_items_single_mod(args.train_data_dir, "training")
     valid_files = build_items_single_mod(args.valid_data_dir, "validation")
     
@@ -144,11 +111,11 @@ def main():
     model_def_out = copy.deepcopy(model_def)
 
     env_config_out["data_base_dir"] = dataroot_dir
-    env_config_out["embedding_base_dir"] = os.path.join(work_dir, env_config_out["embedding_base_dir"])
+    env_config_out["embedding_base_dir"] = os.path.normpath(os.path.join(work_dir, env_config_out["embedding_base_dir"]))
     env_config_out["json_data_list"] = datalist_file
     env_config_out["val_json_data_list"] = val_datalist_file
-    env_config_out["model_dir"] = os.path.join(work_dir, env_config_out["model_dir"])
-    env_config_out["output_dir"] = os.path.join(work_dir, env_config_out["output_dir"])
+    env_config_out["model_dir"] = os.path.normpath(os.path.join(work_dir, env_config_out["model_dir"]))
+    env_config_out["output_dir"] = os.path.normpath(os.path.join(work_dir, env_config_out["output_dir"]))
     env_config_out["trained_autoencoder_path"] = args.pretrained_vae_path #.pth
 
     # Create necessary directories
@@ -161,7 +128,18 @@ def main():
         json.dump(env_config_out, f, sort_keys=True, indent=4)
 
     # Update model configuration for demo
-    train_config_out["diffusion_unet_train"]["n_epochs"] = 10000
+    train_config_out["diffusion_unet_train"]["batch_size"] = 8
+    train_config_out["diffusion_unet_train"]["val_batch_size"] = 4
+    train_config_out["diffusion_unet_train"]["cache_rate"] = 0.1
+    train_config_out["diffusion_unet_train"]["lr"] = 0.0001
+    train_config_out["diffusion_unet_train"]["seed"] = 42
+    train_config_out["diffusion_unet_train"]["report_to"] = True
+    train_config_out["diffusion_unet_train"]["max_train_steps"] = 50000
+    train_config_out["diffusion_unet_train"]["num_valid"] = 1000
+    train_config_out["diffusion_unet_train"]["checkpointing_steps"] = 5000
+    train_config_out["diffusion_unet_train"]["validation_steps"] = 5000
+    train_config_out["diffusion_unet_inference"]["dim"] = [256,256,128]
+    train_config_out["diffusion_unet_inference"]["spacing"] = [0.9375,0.9375,1.2109375]
 
     train_config_filepath = os.path.join(work_dir, "config_maisi_diff_model.json")
     with open(train_config_filepath, "w") as f:
@@ -169,6 +147,7 @@ def main():
 
     # Update model definition for demo
     model_def_out["autoencoder_def"]["num_splits"] = 4
+    model_def_out["diffusion_unet_def"]["num_class_embeds"] = 4
     model_def_filepath = os.path.join(work_dir, "config_maisi.json")
     with open(model_def_filepath, "w") as f:
         json.dump(model_def_out, f, sort_keys=True, indent=4)

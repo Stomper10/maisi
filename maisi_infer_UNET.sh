@@ -1,6 +1,6 @@
 #!/bin/bash
 
-#SBATCH --job-name=E0_UKB
+#SBATCH --job-name=E0_UKB_s3
 #SBATCH --nodes=1
 #SBATCH --gres=gpu:1
 #SBATCH --partition=P2
@@ -8,7 +8,7 @@
 #SBATCH --mem=50GB
 #SBATCH --cpus-per-task=8
 #SBATCH --open-mode=append
-#SBATCH -o /shared/s1/lab06/wonyoung/maisi/logs/%x-%j.txt
+#SBATCH -o /shared/s1/lab06/wonyoung/maisi/logs_ex/%x-%j.txt
 
 source /home/s1/wonyoungjang/.bashrc
 source /home/s1/wonyoungjang/anaconda3/bin/activate
@@ -25,3 +25,4 @@ python3 /shared/s1/lab06/wonyoung/maisi/maisi_infer_UNET.py \
     --train_config="/leelabsg/data/ex_MAISI/$JOB_NAME/config_maisi_diff_model.json" \
     --model_def="/leelabsg/data/ex_MAISI/$JOB_NAME/config_maisi.json" \
     --num_gpus=1 \
+    --ex_seed=800
