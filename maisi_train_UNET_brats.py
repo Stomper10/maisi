@@ -132,7 +132,7 @@ def resume_from_latest(unet, optimizer, lr_scheduler, scaler, model_dir, device)
     ckpt_path = os.path.join(model_dir, "diff_unet_ckpt.pt")
     if not os.path.exists(ckpt_path):
         logging.info("[Resume] No checkpoint directory found. Starting fresh.")
-        return 0, float("inf")
+        return 0, float("inf"), 0
 
     ckpt = torch.load(ckpt_path, map_location=device)
     unet.load_state_dict(ckpt["unet_state_dict"])
@@ -140,7 +140,7 @@ def resume_from_latest(unet, optimizer, lr_scheduler, scaler, model_dir, device)
     if "lr_scheduler" in ckpt: lr_scheduler.load_state_dict(ckpt["lr_scheduler"])
     if "scaler" in ckpt and scaler is not None: scaler.load_state_dict(ckpt["scaler"])
 
-    return ckpt.get("step", 0), ckpt.get("best_val_loss", float("inf"))
+    return ckpt.get("step", 0), ckpt.get("best_val_loss", float("inf")), ckpt.get("epoch", 0)
 
 def reduce_mean_scalar(x):
     t = x.detach().reshape(1).to(torch.float32)
@@ -175,7 +175,7 @@ def main():
         logger.info(yaml.dump(vars(args), sort_keys=False))
         logger.info(f"Training started on {world_size} GPUs.")
         if args.report_to:
-            wandb.init(project="MAISI_UNET_DDP", config=args, name=args.run_name)
+            wandb.init(project="MAISI_UNET_BraTS", config=args, name=args.run_name)
         Path(args.model_dir).mkdir(parents=True, exist_ok=True)
 
     unet = define_instance(args, "diffusion_unet_def").to(device)
@@ -246,6 +246,7 @@ def main():
         persistent_workers=True,
         prefetch_factor=2
     )
+    steps_per_epoch = len(train_loader)
     
     val_total = len(valid_files)
     per_rank = (val_total + world_size - 1) // world_size  # ceil
@@ -268,9 +269,9 @@ def main():
     scaler = GradScaler() if args.amp else None
     loss_pt = torch.nn.L1Loss()
     
-    start_step, best_val_loss = 0, float("inf")
+    start_step, best_val_loss, start_epoch = 0, float("inf"), 0
     if args.resume:
-        start_step, best_val_loss = resume_from_latest(
+        start_step, best_val_loss, start_epoch = resume_from_latest(
             unet, optimizer, lr_scheduler, scaler, args.model_dir, device)
     dist.barrier(device_ids=[local_rank])
     
@@ -288,15 +289,15 @@ def main():
         param_counts = count_parameters(unet)
         logger.info(f"### UNET's Trainable parameters: {param_counts['trainable']:,}")
 
-    def infinite_loader(loader, sampler):
-        epoch = 0
+    def infinite_loader(loader, sampler, start_epoch=0):
+        epoch = start_epoch
         while True:
             sampler.set_epoch(epoch) # DDP CHANGE: 매 에포크마다 샘플러 시드 변경
             for batch in loader:
                 yield batch
             epoch += 1
 
-    train_iter = infinite_loader(train_loader, train_sampler)
+    train_iter = infinite_loader(train_loader, train_sampler, start_epoch)
     progress_bar = trange(start_step, args.max_train_steps + 1,
                           desc=f"Training on Rank {rank}",
                           initial=start_step, total=args.max_train_steps + 1,
@@ -456,6 +457,7 @@ def main():
                     torch.cuda.synchronize(device)
                     best_val_loss = float(avg_loss)
                     unet_state_dict = unet.module._orig_mod.state_dict()
+                    current_epoch = step // steps_per_epoch
                     state = {
                         "unet_state_dict": unet_state_dict,
                         "optimizer": optimizer.state_dict(),
@@ -464,6 +466,7 @@ def main():
                         "best_val_loss": best_val_loss,
                         "num_train_timesteps": num_train_timesteps,
                         "scale_factor": scale_factor,
+                        "epoch": current_epoch
                     }
                     if args.amp:
                         state["scaler"] = scaler.state_dict()
@@ -483,6 +486,7 @@ def main():
         if (is_time_to_save or SHUTDOWN_REQUESTED) and rank == 0:
             torch.cuda.synchronize(device)
             unet_state_dict = unet.module._orig_mod.state_dict()
+            current_epoch = step // steps_per_epoch
             state = {
                 "unet_state_dict": unet_state_dict,
                 "optimizer": optimizer.state_dict(),
@@ -491,6 +495,7 @@ def main():
                 "best_val_loss": float(best_val_loss),
                 "num_train_timesteps": num_train_timesteps,
                 "scale_factor": scale_factor,
+                "epoch": current_epoch
             }
             if args.amp:
                 state["scaler"] = scaler.state_dict()
@@ -509,7 +514,8 @@ def main():
             dist.barrier(device_ids=[local_rank])
 
     if SHUTDOWN_REQUESTED:
-        sys.exit(0)
+        print("Graceful shutdown initiated, exiting with code 1 to trigger requeue.")
+        sys.exit(1) # ✅ 0 대신 1로 변경하여 "실패" 신호 전송
     
     dist.barrier(device_ids=[local_rank]) # DDP CHANGE: 모든 프로세스가 끝날 때까지 대기 후 정리
     cleanup_ddp()

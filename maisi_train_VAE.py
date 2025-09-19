@@ -104,7 +104,7 @@ def resume_from_latest(autoencoder,
                        output_dir, device):
     if not os.path.exists(output_dir):
         print("[Resume] No checkpoint directory found. Starting fresh.")
-        return 0, float("inf")
+        return 0, float("inf"), 0
 
     ckpts = [
         d for d in os.listdir(output_dir)
@@ -114,7 +114,7 @@ def resume_from_latest(autoencoder,
     ]
     if len(ckpts) == 0:
         print("[Resume] No checkpoint found in directory. Starting fresh.")
-        return 0, float("inf")
+        return 0, float("inf"), 0
 
     ckpts = sorted(ckpts, key=lambda x: int(x.split("-")[1]))
     latest_ckpt_dir = ckpts[-1]
@@ -125,14 +125,14 @@ def resume_from_latest(autoencoder,
     
     autoencoder.load_state_dict(ckpt["autoencoder"])
     discriminator.load_state_dict(ckpt["discriminator"])
-    optimizer_g.load_state_dict(ckpt["optimizer_g"])
-    optimizer_d.load_state_dict(ckpt["optimizer_d"])
-    if "scheduler_g" in ckpt: scheduler_g.load_state_dict(ckpt["scheduler_g"])
-    if "scheduler_d" in ckpt: scheduler_d.load_state_dict(ckpt["scheduler_d"])
-    if "scaler_g" in ckpt and scaler_g is not None: scaler_g.load_state_dict(ckpt["scaler_g"])
-    if "scaler_d" in ckpt and scaler_d is not None: scaler_d.load_state_dict(ckpt["scaler_d"])
+    optimizer_g.load_state_dict(ckpt["optimizer_g"]) ### comment this line if s2 first submit
+    optimizer_d.load_state_dict(ckpt["optimizer_d"]) ### comment this line if s2 first submit
+    if "scheduler_g" in ckpt: scheduler_g.load_state_dict(ckpt["scheduler_g"]) ### comment this line if s2 first submit
+    if "scheduler_d" in ckpt: scheduler_d.load_state_dict(ckpt["scheduler_d"]) ### comment this line if s2 first submit
+    if "scaler_g" in ckpt and scaler_g is not None: scaler_g.load_state_dict(ckpt["scaler_g"]) ### comment this line if s2 first submit
+    if "scaler_d" in ckpt and scaler_d is not None: scaler_d.load_state_dict(ckpt["scaler_d"]) ### comment this line if s2 first submit
 
-    return ckpt.get("step", 0), ckpt.get("best_val_loss", float("inf"))
+    return ckpt.get("step", 0), ckpt.get("best_val_loss", float("inf")), ckpt.get("epoch", 0)
 
 def prepare_image_for_logging(image_tensor, center_loc):
     """3D 텐서를 wandb에 로깅할 수 있는 2D 이미지로 변환합니다."""
@@ -158,6 +158,11 @@ def main():
     local_rank = int(os.environ["LOCAL_RANK"])
     world_size = int(os.environ["WORLD_SIZE"])
 
+    if rank == 0:
+        print("="*50)
+        print(f"✅ Training started with a total of {world_size} GPUs across all nodes.")
+        print("="*50)
+
     args = load_config()
     device = torch.device(f"cuda:{local_rank}")
     weight_dtype = torch.float16 if args.weight_dtype == "fp16" else torch.float32
@@ -178,7 +183,7 @@ def main():
         print("[Config] Loaded hyperparameters:")
         print(yaml.dump(vars(args), sort_keys=False))
         if args.report_to:
-            wandb.init(project="MAISI_EX_DDP", config=args, name=args.run_name)
+            wandb.init(project="MAISI_VAE_UKB", config=args, name=args.run_name)
         output_dir = os.path.join(args.output_dir, args.run_name)
         os.makedirs(output_dir, exist_ok=True)
     else:
@@ -230,6 +235,7 @@ def main():
         persistent_workers=True,
         prefetch_factor=2
     )
+    steps_per_epoch = len(dataloader_train)
     
     if rank == 0: print(f"Total number of validation data is {len(val_files)}.")
     val_total = len(val_files)
@@ -267,16 +273,17 @@ def main():
 
     optimizer_g = torch.optim.AdamW(params=autoencoder.parameters(), lr=args.lr, weight_decay=1e-5, eps=1e-6 if args.amp else 1e-8)
     optimizer_d = torch.optim.AdamW(params=discriminator.parameters(), lr=args.lr, weight_decay=1e-5, eps=1e-6 if args.amp else 1e-8)
-    total_opt_steps = (args.max_train_steps - 100000 + args.gradient_accumulation_steps - 1) // args.gradient_accumulation_steps ### s2
+    # total_opt_steps = (args.max_train_steps - 70000 + args.gradient_accumulation_steps - 1) // args.gradient_accumulation_steps ### activate when s2
+    total_opt_steps = (args.max_train_steps + args.gradient_accumulation_steps - 1) // args.gradient_accumulation_steps ### activate when s1
     if rank == 0: print("total_opt_steps:", total_opt_steps)
     scheduler_g = lr_scheduler.CosineAnnealingLR(optimizer_g, T_max=total_opt_steps)
     scheduler_d = lr_scheduler.CosineAnnealingLR(optimizer_d, T_max=total_opt_steps)
     scaler_g, scaler_d = (GradScaler(), GradScaler()) if args.amp else (None, None)
 
-    start_step, best_val_loss = 0, float("inf")
+    start_step, best_val_loss, start_epoch = 0, float("inf"), 0
     if args.resume:
         output_dir_for_resume = os.path.join(args.output_dir, args.run_name)
-        start_step, best_val_loss = resume_from_latest(
+        start_step, best_val_loss, start_epoch = resume_from_latest(
             autoencoder, discriminator, optimizer_g, optimizer_d,
             scheduler_g, scheduler_d, scaler_g, scaler_d, output_dir_for_resume, device)
     dist.barrier(device_ids=[local_rank])
@@ -302,20 +309,21 @@ def main():
     loss_perceptual = PerceptualLoss(spatial_dims=3, network_type="squeeze", is_fake_3d=True, fake_3d_ratio=0.2).eval().to(device)
         
     if rank == 0:
+        print("### start_epoch:", start_epoch)
         param_counts = count_parameters(autoencoder.module)
         print(f"### autoencoder's Trainable parameters: {param_counts['trainable']:,}")
         param_counts = count_parameters(discriminator.module)
         print(f"### discriminator's Trainable parameters: {param_counts['trainable']:,}")
 
-    def infinite_loader(loader, sampler):
-        epoch = 0
+    def infinite_loader(loader, sampler, start_epoch=0):
+        epoch = start_epoch
         while True:
             sampler.set_epoch(epoch) # DDP CHANGE: 매 에포크마다 샘플러 시드 변경
             for batch in loader:
                 yield batch
             epoch += 1
             
-    train_iter = infinite_loader(dataloader_train, train_sampler)
+    train_iter = infinite_loader(dataloader_train, train_sampler, start_epoch)
     progress_bar = trange(start_step, args.max_train_steps + 1,
                           desc=f"Training on Rank {rank}",
                           initial=start_step, total=args.max_train_steps + 1,
@@ -489,6 +497,7 @@ def main():
                     torch.cuda.synchronize(device)
                     autoencoder_state_dict = autoencoder.module._orig_mod.state_dict()
                     discriminator_state_dict = discriminator.module._orig_mod.state_dict()
+                    current_epoch = step // steps_per_epoch
                     best_val_loss = float(val_loss_g)
                     state = {
                         "autoencoder": autoencoder_state_dict,
@@ -499,6 +508,7 @@ def main():
                         "scheduler_d": scheduler_d.state_dict(),
                         "step": step,
                         "best_val_loss": best_val_loss,
+                        "epoch": current_epoch
                     }
                     if args.amp:
                         state["scaler_g"] = scaler_g.state_dict()
@@ -520,6 +530,7 @@ def main():
             torch.cuda.synchronize(device)
             autoencoder_state_dict = autoencoder.module._orig_mod.state_dict()
             discriminator_state_dict = discriminator.module._orig_mod.state_dict()
+            current_epoch = step // steps_per_epoch
             state = {
                 "autoencoder": autoencoder_state_dict,
                 "discriminator": discriminator_state_dict,
@@ -529,6 +540,7 @@ def main():
                 "scheduler_d": scheduler_d.state_dict(),
                 "step": step,
                 "best_val_loss": float(best_val_loss),
+                "epoch": current_epoch
             }
             if args.amp:
                 state["scaler_g"] = scaler_g.state_dict()
