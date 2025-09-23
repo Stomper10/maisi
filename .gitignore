@@ -1,6 +1,7 @@
 # 로그 파일
 *.log
 logs/
+logs_ex/
 wandb/
 
 # 모델 weight

@@ -1,6 +1,6 @@
 #!/bin/bash
 
-#SBATCH --job-name=maisi_vae_s1_ukb
+#SBATCH --job-name=maisi_vae_s2_ukb
 #SBATCH --nodes=2
 #SBATCH --gpus-per-node=4
 #SBATCH --ntasks-per-node=1

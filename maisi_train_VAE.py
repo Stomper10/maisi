@@ -273,8 +273,8 @@ def main():
 
     optimizer_g = torch.optim.AdamW(params=autoencoder.parameters(), lr=args.lr, weight_decay=1e-5, eps=1e-6 if args.amp else 1e-8)
     optimizer_d = torch.optim.AdamW(params=discriminator.parameters(), lr=args.lr, weight_decay=1e-5, eps=1e-6 if args.amp else 1e-8)
-    # total_opt_steps = (args.max_train_steps - 70000 + args.gradient_accumulation_steps - 1) // args.gradient_accumulation_steps ### activate when s2
-    total_opt_steps = (args.max_train_steps + args.gradient_accumulation_steps - 1) // args.gradient_accumulation_steps ### activate when s1
+    total_opt_steps = (args.max_train_steps - 70000 + args.gradient_accumulation_steps - 1) // args.gradient_accumulation_steps ### activate when s2
+    # total_opt_steps = (args.max_train_steps + args.gradient_accumulation_steps - 1) // args.gradient_accumulation_steps ### activate when s1
     if rank == 0: print("total_opt_steps:", total_opt_steps)
     scheduler_g = lr_scheduler.CosineAnnealingLR(optimizer_g, T_max=total_opt_steps)
     scheduler_d = lr_scheduler.CosineAnnealingLR(optimizer_d, T_max=total_opt_steps)
