@@ -114,8 +114,9 @@ def main():
     train_config_out["diffusion_unet_train"]["report_to"] = True
     train_config_out["diffusion_unet_train"]["max_train_steps"] = 100000
     train_config_out["diffusion_unet_train"]["num_valid"] = 1000
-    train_config_out["diffusion_unet_train"]["checkpointing_steps"] = 5000
+    train_config_out["diffusion_unet_train"]["checkpointing_steps"] = 1000
     train_config_out["diffusion_unet_train"]["validation_steps"] = 5000
+    train_config_out["diffusion_unet_train"]["gradient_accumulation_steps"] = 1
     train_config_out["diffusion_unet_inference"]["dim"] = [128,256,128]
     train_config_out["diffusion_unet_inference"]["spacing"] = [1.421875,0.8515625,1.421875]
 

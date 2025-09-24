@@ -14,6 +14,7 @@ from tqdm import trange
 
 import torch
 import torch.distributed as dist
+from torch.nn.utils import clip_grad_norm_
 from torch.amp import GradScaler, autocast
 from torch.nn.parallel import DistributedDataParallel as DDP
 
@@ -121,13 +122,28 @@ def load_config():
         setattr(args, k, v)
     return args
 
-def resume_from_latest(unet, optimizer, lr_scheduler, scaler, model_dir, device):
-    ckpt_path = os.path.join(model_dir, "diff_unet_ckpt.pt")
-    if not os.path.exists(ckpt_path):
-        logging.info("[Resume] No checkpoint directory found. Starting fresh.")
+def resume_from_latest(unet, optimizer, lr_scheduler, scaler, output_dir, device):
+    if not os.path.exists(output_dir):
+        print("[Resume] No checkpoint directory found. Starting fresh.")
         return 0, float("inf"), 0
+    
+    ckpts = [
+        d for d in os.listdir(output_dir)
+        if d.startswith("checkpoint-")
+        and os.path.isdir(os.path.join(output_dir, d))
+        and os.path.exists(os.path.join(output_dir, d, "diff_unet_ckpt.pt"))
+    ]
+    if len(ckpts) == 0:
+        print("[Resume] No checkpoint found in directory. Starting fresh.")
+        return 0, float("inf"), 0
+    
+    ckpts = sorted(ckpts, key=lambda x: int(x.split("-")[1]))
+    latest_ckpt_dir = ckpts[-1]
+    print(f"[Resume] Resuming from checkpoint: {latest_ckpt_dir}")
 
-    ckpt = torch.load(ckpt_path, map_location=device)
+    path = os.path.join(output_dir, latest_ckpt_dir, "diff_unet_ckpt.pt")
+    ckpt = torch.load(path, map_location=device)
+
     unet.load_state_dict(ckpt["unet_state_dict"])
     optimizer.load_state_dict(ckpt["optimizer"])
     if "lr_scheduler" in ckpt: lr_scheduler.load_state_dict(ckpt["lr_scheduler"])
@@ -147,9 +163,20 @@ def main():
     local_rank = int(os.environ["LOCAL_RANK"])
     world_size = int(os.environ["WORLD_SIZE"])
 
+    logger = setup_logging("training")
+
+    if rank == 0:
+        logger.info("="*50)
+        logger.info(f"✅ Training started with a total of {world_size} GPUs across all nodes.")
+        logger.info("="*50)
+
     args = load_config()
     device = torch.device(f"cuda:{local_rank}")
+    logger.info(f"Using {device} of {world_size}")
     #weight_dtype = torch.float16 if args.weight_dtype == "fp16" else torch.float32
+
+    if rank == 0:
+        logger.info(f"[Opt] Using gradient accumulation with {args.gradient_accumulation_steps} steps.")
 
     # OPTIMIZATION: 각 프로세스에 다른 시드를 주어 데이터 증강의 다양성 확보
     set_determinism(seed=args.seed + rank)
@@ -158,7 +185,7 @@ def main():
     torch.backends.cudnn.allow_tf32 = True
     torch.backends.cudnn.benchmark = True
     torch.backends.cudnn.deterministic = False
-    torch.set_float32_matmul_precision("highest")
+    torch.set_float32_matmul_precision("high")
 
     logger = setup_logging("training")
     logger.info(f"Using {device} of {world_size}")
@@ -180,9 +207,6 @@ def main():
 
     # trianing data
     filenames_train = load_filenames(args.json_data_list, "training")
-    if local_rank == 0:
-        logger.info(f"num_files_train: {len(filenames_train)}")
-
     train_files = []
     for _i in range(len(filenames_train)):
         str_img = os.path.join(args.embedding_base_dir, filenames_train[_i])
@@ -198,9 +222,6 @@ def main():
 
     # validation data
     filenames_valid = load_filenames(args.val_json_data_list, "validation")[:args.num_valid]
-    if local_rank == 0:
-        logger.info(f"num_files_valid: {len(filenames_valid)}")
-
     valid_files = []
     for _i in range(len(filenames_valid)):
         str_img = os.path.join(args.embedding_base_dir, filenames_valid[_i])
@@ -252,7 +273,8 @@ def main():
 
     scale_factor = calculate_scale_factor(train_loader, device)
     optimizer = torch.optim.Adam(params=unet.parameters(), lr=args.lr, fused=True)
-    lr_scheduler = torch.optim.lr_scheduler.PolynomialLR(optimizer, total_iters=args.max_train_steps, power=2.0)
+    total_opt_steps = (args.max_train_steps + args.gradient_accumulation_steps - 1) // args.gradient_accumulation_steps
+    lr_scheduler = torch.optim.lr_scheduler.PolynomialLR(optimizer, total_iters=total_opt_steps, power=2.0)
     scaler = GradScaler() if args.amp else None
     loss_pt = torch.nn.L1Loss()
     
@@ -273,6 +295,7 @@ def main():
 
     # count params
     if rank == 0:
+        logger.info(f"### start_epoch: {start_epoch}")
         param_counts = count_parameters(unet)
         logger.info(f"### UNET's Trainable parameters: {param_counts['trainable']:,}")
 
@@ -351,19 +374,26 @@ def main():
                 )
 
             loss = loss_pt(model_output.float(), model_gt.float())
+            loss = loss / args.gradient_accumulation_steps
 
         if args.amp:
             scaler.scale(loss).backward()
-            scaler.step(optimizer)
-            scaler.update()
         else:
             loss.backward()
-            optimizer.step()
 
-        lr_scheduler.step()
-        optimizer.zero_grad(set_to_none=True)
+        if (step + 1) % args.gradient_accumulation_steps == 0:
+            if args.amp:
+                scaler.unscale_(optimizer)
+                clip_grad_norm_(unet.parameters(), 1.0)
+                scaler.step(optimizer)
+                scaler.update()
+            else:
+                clip_grad_norm_(unet.parameters(), 1.0)
+                optimizer.step()
+            lr_scheduler.step()
+            optimizer.zero_grad(set_to_none=True)
 
-        loss_log = reduce_mean_scalar(loss)
+        loss_log = reduce_mean_scalar(loss) * args.gradient_accumulation_steps
 
         if rank == 0:
             progress_bar.set_postfix({'Total_loss': f"{loss_log:.4f}"})
@@ -375,7 +405,7 @@ def main():
                 wandb.log(log_data, step=step)
 
         did_validate = False
-        if step % args.validation_steps == 0 and step > start_step:
+        if (step % args.validation_steps == 0 or step == args.max_train_steps) and step > start_step:
             did_validate = True
             unet.eval()
             val_epoch_loss = {"loss": 0}
@@ -428,7 +458,7 @@ def main():
             val_metrics = torch.tensor([val_epoch_loss["loss"], num_val_batches_local], device=device)
             dist.all_reduce(val_metrics, op=dist.ReduceOp.SUM)
         
-            total_batches = val_metrics[1].item()
+            total_batches = val_metrics[-1].item()
             avg_loss = val_metrics[0].item() / total_batches if total_batches > 0 else 0
             #val_loss = {"loss": avg_loss}
 
@@ -440,9 +470,9 @@ def main():
 
                 if avg_loss < best_val_loss:
                     torch.cuda.synchronize(device)
-                    best_val_loss = float(avg_loss)
                     unet_state_dict = unet.module._orig_mod.state_dict()
                     current_epoch = step // steps_per_epoch
+                    best_val_loss = float(avg_loss)
                     state = {
                         "unet_state_dict": unet_state_dict,
                         "optimizer": optimizer.state_dict(),
@@ -456,8 +486,9 @@ def main():
                     if args.amp:
                         state["scaler"] = scaler.state_dict()
                     
-                    best_ckpt_path = os.path.join(args.model_dir, args.model_filename.replace('.pt', '_best.pt'))
-                    atomic_save(state, best_ckpt_path)
+                    best_dir = os.path.join(args.model_dir, "best-checkpoint")
+                    os.makedirs(best_dir, exist_ok=True)
+                    atomic_save(state, os.path.join(best_dir, "diff_unet_ckpt.pt"))
                     logger.info(f"[best] updated at step {step}: {best_val_loss:.6f}")
                 else:
                     logger.info(f"[not best] not updated at step {step}: {avg_loss:.6f}")
@@ -485,8 +516,9 @@ def main():
             if args.amp:
                 state["scaler"] = scaler.state_dict()
             
-            ckpt_dir = os.path.join(args.model_dir, args.model_filename)
-            atomic_save(state, ckpt_dir)
+            ckpt_dir = os.path.join(args.model_dir, f"checkpoint-{step}")
+            os.makedirs(ckpt_dir, exist_ok=True)
+            atomic_save(state, os.path.join(ckpt_dir, "diff_unet_ckpt.pt"))
             logger.info(f"\nSaved Step {step} checkpoint to {ckpt_dir}")
 
         shutdown_tensor = torch.tensor([1 if (rank == 0 and SHUTDOWN_REQUESTED) else 0], device=device)

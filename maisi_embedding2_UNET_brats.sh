@@ -1,14 +1,14 @@
 #!/bin/bash
 
-#SBATCH --job-name=EX_BraTS_temp
+#SBATCH --job-name=maisi_brats
 #SBATCH --nodes=1
-#SBATCH --gres=gpu:4
+#SBATCH --gres=gpu:1
 #SBATCH --partition=P2
 #SBATCH --time=0-12:00:00
 #SBATCH --mem=50GB
 #SBATCH --cpus-per-task=32
 #SBATCH --open-mode=append
-#SBATCH -o /shared/s1/lab06/wonyoung/maisi/logs/%x-%j.txt
+#SBATCH -o /shared/s1/lab06/wonyoung/maisi/logs_ex/%x-%j.txt
 
 source /home/s1/wonyoungjang/.bashrc
 source /home/s1/wonyoungjang/anaconda3/bin/activate
@@ -23,4 +23,4 @@ python3 /shared/s1/lab06/wonyoung/maisi/maisi_embedding2_UNET_brats.py \
     --env_config="/leelabsg/data/ex_MAISI/$JOB_NAME/environment_maisi_diff_model.json" \
     --train_config="/leelabsg/data/ex_MAISI/$JOB_NAME/config_maisi_diff_model.json" \
     --model_def="/leelabsg/data/ex_MAISI/$JOB_NAME/config_maisi.json" \
-    --num_gpus=4 \
+    --num_gpus=1 \

@@ -8,6 +8,8 @@ wandb/
 *.pt
 *.pth
 *.ckpt
+weights/v1/
+weights/v2/
 
 # 결과물
 results/

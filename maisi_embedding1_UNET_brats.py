@@ -134,10 +134,11 @@ def main():
     train_config_out["diffusion_unet_train"]["lr"] = 0.0001
     train_config_out["diffusion_unet_train"]["seed"] = 42
     train_config_out["diffusion_unet_train"]["report_to"] = True
-    train_config_out["diffusion_unet_train"]["max_train_steps"] = 50000
+    train_config_out["diffusion_unet_train"]["max_train_steps"] = 20000
     train_config_out["diffusion_unet_train"]["num_valid"] = 1000
-    train_config_out["diffusion_unet_train"]["checkpointing_steps"] = 5000
-    train_config_out["diffusion_unet_train"]["validation_steps"] = 5000
+    train_config_out["diffusion_unet_train"]["checkpointing_steps"] = 1000
+    train_config_out["diffusion_unet_train"]["validation_steps"] = 1000
+    train_config_out["diffusion_unet_train"]["gradient_accumulation_steps"] = 1
     train_config_out["diffusion_unet_inference"]["dim"] = [256,256,128]
     train_config_out["diffusion_unet_inference"]["spacing"] = [0.9375,0.9375,1.2109375]
 

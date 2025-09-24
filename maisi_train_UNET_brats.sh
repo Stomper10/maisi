@@ -1,7 +1,7 @@
 #!/bin/bash
 
-#SBATCH --job-name=EX_BraTS_temp
-#SBATCH --nodes=1
+#SBATCH --job-name=unet_maisi_brats
+#SBATCH --nodes=2
 #SBATCH --gres=gpu:4
 #SBATCH --ntasks-per-node=1
 #SBATCH --cpus-per-task=32 
@@ -17,53 +17,46 @@ source /home/s1/wonyoungjang/.bashrc
 source /home/s1/wonyoungjang/anaconda3/bin/activate
 conda activate wdm
 
-export MASTER_ADDR=$(scontrol show hostnames "$SLURM_JOB_NODELIST" | head -n1)  # 단일 노드면 127.0.0.1도 OK
+# --- 환경 변수 설정 (기존과 동일) ---
+export MASTER_ADDR=$(scontrol show hostnames "$SLURM_JOB_NODELIST" | head -n1)
 export MASTER_PORT=$((10000 + RANDOM % 50000))
-export NCCL_ASYNC_ERROR_HANDLING=1
-export NCCL_DEBUG=WARN
 export OMP_NUM_THREADS=1
-ulimit -n 1048576
 
-echo "Starting MAISI UNET BraTS DDP training on 4 GPUs..."
+echo "BraTS - Starting MAISI VAE MULTI-NODE DDP training on 2 nodes (8 GPUs)..."
+echo "MASTER_ADDR: $MASTER_ADDR, MASTER_PORT: $MASTER_PORT"
 
-# --- requeue 로직은 기존과 동일 ---
 max_restarts=1000
-restarts=$(scontrol show job ${SLURM_JOB_ID} -o | awk -F'|' '{print $11}')
+scontext=$(scontrol show job ${SLURM_JOB_ID})
+restarts=$(echo ${scontext} | grep -o 'Restarts=[0-9]*****' | cut -d= -f2)
+
 function resubmit()
 {
-    echo "Job time limit approaching. Signaling Python to save and exit..."
-    if [[ -n $pid ]]; then kill -SIGTERM -- -$pid; fi
-    wait $pid
-    echo "Python process finished gracefully. Requeuing job..."
     if [[ $restarts -lt $max_restarts ]]; then
         scontrol requeue ${SLURM_JOB_ID}
+        exit 0
     else
-        echo "Job is over the Maximum restarts limit."
+        echo "Your job is over the Maximum restarts limit"
         exit 1
     fi
 }
+
 trap 'resubmit' SIGUSR1
 
-export JOB_NAME="EX_BraTS_temp"
-set -m
-time torchrun --nproc_per_node=4 maisi_train_UNET_brats.py \
+export JOB_NAME="maisi_brats"
+
+srun --cpu-bind=none,v --accel-bind=gn torchrun \
+    --nproc_per_node=4 \
+    --nnodes=$SLURM_NNODES \
+    --node_rank=$SLURM_NODEID \
+    --rdzv_id=$SLURM_JOB_ID \
+    --rdzv_backend=c10d \
+    --rdzv_endpoint=$MASTER_ADDR:$MASTER_PORT \
+    maisi_train_UNET_brats.py \
     --env_config_path="/leelabsg/data/ex_MAISI/$JOB_NAME/environment_maisi_diff_model.json" \
     --train_config_path="/leelabsg/data/ex_MAISI/$JOB_NAME/config_maisi_diff_model.json" \
     --model_config_path="/leelabsg/data/ex_MAISI/$JOB_NAME/config_maisi.json" \
     --cpus_per_task=${SLURM_CPUS_PER_TASK} \
-    --run_name=$JOB_NAME \
+    --run_name=${JOB_NAME} \
     --resume &
-pid=$!
-set +m
-wait $pid
-
-echo "Training completed or terminated by signal."
-exit_code=$?
-
-if [[ $exit_code -ne 0 ]]; then
-  echo "Python exited with code $exit_code"
-  exit $exit_code
-fi
-
-echo "Training completed or terminated by signal."
+wait
 exit 0

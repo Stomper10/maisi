@@ -1,6 +1,6 @@
 #!/bin/bash
 
-#SBATCH --job-name=EX_UKB_temp
+#SBATCH --job-name=maisi_ukb
 #SBATCH --nodes=1
 #SBATCH --gres=gpu:4
 #SBATCH --partition=P2
@@ -25,4 +25,4 @@ python3 /shared/s1/lab06/wonyoung/maisi/maisi_embedding2_UNET.py \
     --model_def="/leelabsg/data/ex_MAISI/$JOB_NAME/config_maisi.json" \
     --train_label_dir="/shared/s1/lab06/wonyoung/diffusers/sd3/data/train.csv" \
     --valid_label_dir="/shared/s1/lab06/wonyoung/diffusers/sd3/data/valid.csv" \
-    --num_gpus=4 \
+    --num_gpus=1 \
