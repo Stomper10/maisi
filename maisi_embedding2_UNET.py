@@ -160,7 +160,7 @@ def diff_model_create_training_data(
         model_def_path (str): Path to the model definition file.
     """
     args = load_config(env_config_path, model_config_path, model_def_path)
-    local_rank, world_size, device = initialize_distributed(num_gpus=num_gpus)
+    local_rank, world_size, device = initialize_distributed() ### num_gpus=num_gpus
     logger = setup_logging("creating training data")
     logger.info(f"Using device {device}")
 

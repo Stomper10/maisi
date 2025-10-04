@@ -106,13 +106,13 @@ def main():
         json.dump(env_config_out, f, sort_keys=True, indent=4)
 
     # Update model configuration for demo
-    train_config_out["diffusion_unet_train"]["batch_size"] = 16
-    train_config_out["diffusion_unet_train"]["val_batch_size"] = 8
+    train_config_out["diffusion_unet_train"]["batch_size"] = 64
+    train_config_out["diffusion_unet_train"]["val_batch_size"] = 16
     train_config_out["diffusion_unet_train"]["cache_rate"] = 0.1
     train_config_out["diffusion_unet_train"]["lr"] = 0.0001
     train_config_out["diffusion_unet_train"]["seed"] = 42
     train_config_out["diffusion_unet_train"]["report_to"] = True
-    train_config_out["diffusion_unet_train"]["max_train_steps"] = 100000
+    train_config_out["diffusion_unet_train"]["max_train_steps"] = 300000
     train_config_out["diffusion_unet_train"]["num_valid"] = 1000
     train_config_out["diffusion_unet_train"]["checkpointing_steps"] = 1000
     train_config_out["diffusion_unet_train"]["validation_steps"] = 5000

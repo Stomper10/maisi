@@ -29,7 +29,7 @@
         "data_dir": "/leelabsg/data/20252_unzip/",
         "max_train_steps": 350000,
         "num_valid": 1000,
-        "checkpointing_steps": 10000,
+        "checkpointing_steps": 1000,
         "validation_steps": 10000,
         "early_stop_patience": 100000000,
         "early_stop_min_delta": 0.01,

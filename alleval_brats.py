@@ -72,6 +72,58 @@ def load_config():
         setattr(args, k, v)
     return args
 
+def _pairwise_distances(x, y):
+    # x: [N, D], y: [M, D]
+    # returns [N, M]
+    x2 = np.sum(x**2, axis=1, keepdims=True)  # (N,1)
+    y2 = np.sum(y**2, axis=1, keepdims=True).T  # (1,M)
+    xy = x @ y.T
+    # numerical stability
+    d2 = np.maximum(x2 + y2 - 2 * xy, 0.0)
+    return np.sqrt(d2, dtype=np.float64)
+
+def compute_prdc(real_features, gen_features, k=3):
+    """
+    real_features: (N_r, D), gen_features: (N_g, D), both float64/float32
+    Implements Kynkäänniemi+ (Improved Precision/Recall) and Naeem+ (Density/Coverage).
+    """
+    real_features = np.asarray(real_features, dtype=np.float64)
+    gen_features  = np.asarray(gen_features,  dtype=np.float64)
+
+    # kNN radii
+    d_rr = _pairwise_distances(real_features, real_features)
+    # exclude self (set diagonal to +inf) to mimic "k-th neighbor other than self"
+    np.fill_diagonal(d_rr, np.inf)
+    r_real = np.partition(d_rr, kth=k-1, axis=1)[:, k-1]  # radius for each real
+
+    d_gg = _pairwise_distances(gen_features, gen_features)
+    np.fill_diagonal(d_gg, np.inf)
+    r_gen = np.partition(d_gg, kth=k-1, axis=1)[:, k-1]   # radius for each gen
+
+    # cross distances
+    d_gr = _pairwise_distances(gen_features, real_features)  # (N_g, N_r)
+    d_rg = d_gr.T                                           # (N_r, N_g)
+
+    # Precision: gen within some real ball
+    nearest_real_idx_for_gen = np.argmin(d_gr, axis=1)         # (N_g,)
+    prec = np.mean(d_gr[np.arange(d_gr.shape[0]), nearest_real_idx_for_gen]
+                   <= r_real[nearest_real_idx_for_gen])
+
+    # Recall: real within some gen ball (uses gen radii)
+    nearest_gen_idx_for_real = np.argmin(d_rg, axis=1)          # (N_r,)
+    rec = np.mean(d_rg[np.arange(d_rg.shape[0]), nearest_gen_idx_for_real]
+                  <= r_gen[nearest_gen_idx_for_real])
+
+    # Coverage: fraction of real covered by any gen within r_real(real)
+    min_dist_real_to_any_gen = np.min(d_rg, axis=1)             # (N_r,)
+    cov = np.mean(min_dist_real_to_any_gen <= r_real)
+
+    # Density: for each gen, how many real balls contain it, divided by k, averaged across gen
+    # Indicator matrix: real j includes gen i if d_gr[i, j] <= r_real[j]
+    includes = (d_gr <= r_real[None, :])                        # (N_g, N_r)
+    den = np.mean(np.sum(includes, axis=1) / float(k))          # average over gen
+    return float(prec), float(rec), float(den), float(cov)
+
 def post_process(act):
     mu = np.mean(act, axis=0)
     sigma = np.cov(act, rowvar=False)
@@ -198,6 +250,7 @@ def load_nii_as_tensor(filepath):
     
 def save_wandb_style_xyz_plot(tensor_1chw, filename, output_dir):
     center = find_label_center_loc(tensor_1chw[0])  # (H, W, D)
+    center = [120,120,77]
     vis_image = get_xyz_plot(tensor_1chw, center, mask_bool=False)
     vis_image = (vis_image - vis_image.min()) / (vis_image.max() - vis_image.min() + 1e-8)
     vis_image = (vis_image * 255).astype(np.uint8)
@@ -299,6 +352,8 @@ def main():
         unet.eval()
         scale_factor = ckpt["scale_factor"]
 
+    feature_extractor = get_feature_extractor()
+
     final_results = {}
     for mod in MODALITIES.keys():
         print(f"\n{'='*20} Processing Modality: {mod.upper()} {'='*20}")
@@ -311,7 +366,6 @@ def main():
         dataset_base = CacheDataset(data=base_files, transform=transform, cache_rate=0.0, num_workers=4)
         dataloader_base = DataLoader(dataset_base, batch_size=1, num_workers=4, shuffle=False)
 
-        feature_extractor = get_feature_extractor()
         base_volumes, other_volumes = [], []
 
         # Data
@@ -445,12 +499,19 @@ def main():
             m_base, s_base = post_process(act_base_subset)
             m_other, s_other = post_process(act_other_subset)
             fid_scores.append(calculate_frechet_distance(m_base, s_base, m_other, s_other))
-            precision, recall = calculate_precision_recall(act_base_subset, act_other_subset, k=3)
-            precision_scores.append(precision)
-            recall_scores.append(recall)
-            density, coverage = calculate_density_coverage(act_base_subset, act_other_subset, k=3)
-            density_scores.append(density)
-            coverage_scores.append(coverage)
+            
+            # precision, recall = calculate_precision_recall(act_base_subset, act_other_subset, k=3)
+            # precision_scores.append(precision)
+            # recall_scores.append(recall)
+            # density, coverage = calculate_density_coverage(act_base_subset, act_other_subset, k=3)
+            # density_scores.append(density)
+            # coverage_scores.append(coverage)
+            
+            prec, rec, den, cov = compute_prdc(act_base_subset, act_other_subset, k=3)
+            precision_scores.append(prec)
+            recall_scores.append(rec)
+            density_scores.append(den)
+            coverage_scores.append(cov)
             
             print(f'\rIteration {i+1}/{len(SEEDS)} done.', end='', flush=True)
         print("\nBootstrapping finished.")

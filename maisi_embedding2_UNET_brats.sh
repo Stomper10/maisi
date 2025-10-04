@@ -2,7 +2,7 @@
 
 #SBATCH --job-name=maisi_brats
 #SBATCH --nodes=1
-#SBATCH --gres=gpu:1
+#SBATCH --gres=gpu:4
 #SBATCH --partition=P2
 #SBATCH --time=0-12:00:00
 #SBATCH --mem=50GB
@@ -19,8 +19,8 @@ echo "MAISI BraTS preprocessing step 2 for Unet."
 
 export JOB_NAME=${SLURM_JOB_NAME}
 
-python3 /shared/s1/lab06/wonyoung/maisi/maisi_embedding2_UNET_brats.py \
+torchrun --nproc_per_node=4 /shared/s1/lab06/wonyoung/maisi/maisi_embedding2_UNET_brats.py \
     --env_config="/leelabsg/data/ex_MAISI/$JOB_NAME/environment_maisi_diff_model.json" \
     --train_config="/leelabsg/data/ex_MAISI/$JOB_NAME/config_maisi_diff_model.json" \
     --model_def="/leelabsg/data/ex_MAISI/$JOB_NAME/config_maisi.json" \
-    --num_gpus=1 \
+    --num_gpus=4 \
