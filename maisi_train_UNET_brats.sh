@@ -1,6 +1,6 @@
 #!/bin/bash
 
-#SBATCH --job-name=unet_maisi_brats
+#SBATCH --job-name=unet_maisi_brats_l2
 #SBATCH --nodes=2
 #SBATCH --gres=gpu:4
 #SBATCH --ntasks-per-node=1
@@ -42,8 +42,6 @@ function resubmit()
 
 trap 'resubmit' SIGUSR1
 
-export JOB_NAME="maisi_brats"
-
 srun --cpu-bind=none,v --accel-bind=gn torchrun \
     --nproc_per_node=4 \
     --nnodes=$SLURM_NNODES \
@@ -52,11 +50,11 @@ srun --cpu-bind=none,v --accel-bind=gn torchrun \
     --rdzv_backend=c10d \
     --rdzv_endpoint=$MASTER_ADDR:$MASTER_PORT \
     maisi_train_UNET_brats.py \
-    --env_config_path="/leelabsg/data/ex_MAISI/$JOB_NAME/environment_maisi_diff_model.json" \
-    --train_config_path="/leelabsg/data/ex_MAISI/$JOB_NAME/config_maisi_diff_model.json" \
-    --model_config_path="/leelabsg/data/ex_MAISI/$JOB_NAME/config_maisi.json" \
+    --env_config_path="/leelabsg/data/ex_MAISI/maisi_brats/environment_maisi_diff_model_l2.json" \
+    --train_config_path="/leelabsg/data/ex_MAISI/maisi_brats/config_maisi_diff_model.json" \
+    --model_config_path="/leelabsg/data/ex_MAISI/maisi_brats/config_maisi.json" \
     --cpus_per_task=${SLURM_CPUS_PER_TASK} \
-    --run_name=${JOB_NAME} \
+    --run_name=${SLURM_JOB_NAME} \
     --resume &
 wait
 exit 0

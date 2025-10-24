@@ -42,8 +42,6 @@ function resubmit()
 
 trap 'resubmit' SIGUSR1
 
-export JOB_NAME="maisi_ukb"
-
 srun --cpu-bind=none,v --accel-bind=gn torchrun \
     --nproc_per_node=4 \
     --nnodes=$SLURM_NNODES \
@@ -52,11 +50,11 @@ srun --cpu-bind=none,v --accel-bind=gn torchrun \
     --rdzv_backend=c10d \
     --rdzv_endpoint=$MASTER_ADDR:$MASTER_PORT \
     maisi_train_UNET.py \
-    --env_config_path="/leelabsg/data/ex_MAISI/$JOB_NAME/environment_maisi_diff_model.json" \
-    --train_config_path="/leelabsg/data/ex_MAISI/$JOB_NAME/config_maisi_diff_model.json" \
-    --model_config_path="/leelabsg/data/ex_MAISI/$JOB_NAME/config_maisi.json" \
+    --env_config_path="/leelabsg/data/ex_MAISI/maisi_ukb/environment_maisi_diff_model.json" \
+    --train_config_path="/leelabsg/data/ex_MAISI/maisi_ukb/config_maisi_diff_model.json" \
+    --model_config_path="/leelabsg/data/ex_MAISI/maisi_ukb/config_maisi.json" \
     --cpus_per_task=${SLURM_CPUS_PER_TASK} \
-    --run_name=${JOB_NAME} \
+    --run_name=${SLURM_JOB_NAME} \
     --resume &
 wait
 exit 0

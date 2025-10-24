@@ -152,9 +152,9 @@ def resume_from_latest(unet, optimizer, lr_scheduler, scaler, output_dir, device
     ckpt = torch.load(path, map_location=device)
 
     unet.load_state_dict(ckpt["unet_state_dict"])
-    optimizer.load_state_dict(ckpt["optimizer"])
-    if "lr_scheduler" in ckpt: lr_scheduler.load_state_dict(ckpt["lr_scheduler"])
-    if "scaler" in ckpt and scaler is not None: scaler.load_state_dict(ckpt["scaler"])
+    optimizer.load_state_dict(ckpt["optimizer"]) ####
+    if "lr_scheduler" in ckpt: lr_scheduler.load_state_dict(ckpt["lr_scheduler"]) ####
+    if "scaler" in ckpt and scaler is not None: scaler.load_state_dict(ckpt["scaler"]) ####
 
     return ckpt.get("step", 0), ckpt.get("best_val_loss", float("inf")), ckpt.get("epoch", 0)
 
@@ -282,10 +282,13 @@ def main():
 
     scale_factor = calculate_scale_factor(train_loader, device)
     optimizer = torch.optim.Adam(params=unet.parameters(), lr=args.lr, fused=True)
-    total_opt_steps = (args.max_train_steps + args.gradient_accumulation_steps - 1) // args.gradient_accumulation_steps
+    total_opt_steps = (args.max_train_steps + args.gradient_accumulation_steps - 1) // args.gradient_accumulation_steps ####
     lr_scheduler = torch.optim.lr_scheduler.PolynomialLR(optimizer, total_iters=total_opt_steps, power=2.0)
     scaler = GradScaler() if args.amp else None
-    loss_pt = torch.nn.L1Loss()
+    if args.loss_type == "l1":
+        loss_pt = torch.nn.L1Loss()
+    elif args.loss_type == "l2":
+        loss_pt = torch.nn.MSELoss()
     
     start_step, best_val_loss, start_epoch = 0, float("inf"), 0
     if args.resume:
